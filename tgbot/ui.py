@@ -9,7 +9,14 @@ def kb(rows):
     ])
 
 def cycle(lst, cur):
-    return lst[(lst.index(cur) + 1) % len(lst)]
+    """Next value in a list. An unknown current value returns the first item."""
+    items = list(lst or [])
+    if not items:
+        return cur
+    try:
+        return items[(items.index(cur) + 1) % len(items)]
+    except ValueError:
+        return items[0]
 
 def progress_bar(frac, width=12):
     frac = max(0.0, min(1.0, float(frac)))
@@ -104,10 +111,10 @@ async def tune_kb(pc):
     ho = gm.get("homing_origin") or [0,0,0]
     z = ho[2] if len(ho) > 2 else 0
     return kb([
-        [("🚀 Скорость −", "u:speed-"), (f"{sp}%", "u:noop"), ("Скорость +", "u:speed+")],
-        [("💧 Поток −", "u:flow-"), (f"{fl}%", "u:noop"), ("Поток +", "u:flow+")],
+        [("🚀 Скорость −", "u:speed-"), (f"{sp}%", "m:noop"), ("Скорость +", "u:speed+")],
+        [("💧 Поток −", "u:flow-"), (f"{fl}%", "m:noop"), ("Поток +", "u:flow+")],
         [("💨 Вент ВКЛ", "u:fan:on"), ("💨 Вент ВЫКЛ", "u:fan:off")],
-        [("⬇️ Z−0.05", "u:z-"), (f"Z-off: {z:.2f}", "u:noop"), ("⬆️ Z+0.05", "u:z+")],
+        [("⬇️ Z−0.05", "u:z-"), (f"Z-off: {z:.2f}", "m:noop"), ("⬆️ Z+0.05", "u:z+")],
         [("🔄", "u:tune"), ("⬅️ Меню", "m:main")]
     ])
 

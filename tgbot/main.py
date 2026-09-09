@@ -6,7 +6,7 @@ from .config import load
 from .logsetup import setup
 from .printer import PrinterClient
 from .ws import MoonrakerWS, health_loop
-from .handlers import router
+from .handlers import router, janitor_loop
 
 log = logging.getLogger("tgbot")
 
@@ -24,17 +24,18 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
 
-    pc = PrinterClient(cfg.moonraker)
+    pc = PrinterClient.from_config(cfg)
     ws = MoonrakerWS(cfg, bot)
     ws_task = asyncio.create_task(ws.run())
     health_task = asyncio.create_task(health_loop(pc, bot, cfg, ws))
+    janitor_task = asyncio.create_task(janitor_loop(cfg))
 
     log.info("bot v%s starting", __version__)
     try:
         await dp.start_polling(bot, pc=pc, cfg=cfg, ws=ws)
     finally:
-        for t in (ws_task, health_task): t.cancel()
-        await asyncio.gather(ws_task, health_task, return_exceptions=True)
+        for t in (ws_task, health_task, janitor_task): t.cancel()
+        await asyncio.gather(ws_task, health_task, janitor_task, return_exceptions=True)
         await pc.close()
         with contextlib.suppress(Exception):
             await bot.session.close()

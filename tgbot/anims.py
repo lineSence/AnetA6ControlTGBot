@@ -1,11 +1,19 @@
 from __future__ import annotations
-import asyncio, logging, os, shutil, subprocess, tempfile
+import asyncio, logging, os, shutil, subprocess, tempfile, time
 from datetime import datetime
 from pathlib import Path
 from aiogram.types import FSInputFile
 from . import errorlog
 
 log = logging.getLogger("tgbot")
+
+# Files this bot generates. Everything else in anims/ belongs to the user.
+MANAGED_NAME_PREFIXES = (".tgbot_anim_", "anim_", "_stop_all", "_autostart")
+SUPPORTED_MEDIA_EXT = {
+    ".gif", ".png", ".jpg", ".jpeg", ".bmp", ".webp",
+    ".mp4", ".mov", ".mkv", ".webm", ".avi",
+}
+MAX_MEDIA_BYTES = 20 * 1024 * 1024
 
 def atomic_write(path, text):
     path = Path(path)
@@ -66,7 +74,11 @@ def snapshot_anims(cfg) -> Path:
     src = Path(anims_dir(cfg))
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     dst = Path(cfg.backup_dir) / stamp
-    dst.mkdir(parents=True, exist_ok=False)
+    suffix = 1
+    while dst.exists():
+        dst = Path(cfg.backup_dir) / f"{stamp}_{suffix}"
+        suffix += 1
+    dst.mkdir(parents=True)
     if src.exists():
         for p in src.iterdir():
             target = dst / p.name
@@ -82,13 +94,20 @@ def latest_backup(cfg) -> Path | None:
     dirs = sorted([p for p in root.iterdir() if p.is_dir()])
     return dirs[-1] if dirs else None
 
+def is_managed_name(name) -> bool:
+    """True for files the bot generates. Foreign files must survive a rollback."""
+    return str(name).startswith(MANAGED_NAME_PREFIXES)
+
 def rollback_anims(cfg, backup: Path | None = None):
     backup = backup or latest_backup(cfg)
     if backup is None or not backup.exists():
         raise RuntimeError("резервная копия анимаций не найдена")
     target = Path(anims_dir(cfg))
     target.mkdir(parents=True, exist_ok=True)
+    restored = {p.name for p in backup.iterdir() if p.name != "_index.json"}
     for p in target.iterdir():
+        if not is_managed_name(p.name) and p.name not in restored:
+            continue
         if p.is_file() or p.is_symlink(): p.unlink()
         elif p.is_dir(): shutil.rmtree(p)
     for p in backup.iterdir():
@@ -127,12 +146,13 @@ def convert_params(cfg, src, out_cfg, prefix, s, preview_base=None):
         cmd.append("--invert")
     if preview_base:
         cmd += ["--preview-out", preview_base]
+    limit = max(30, int(getattr(cfg, "animation_ffmpeg_timeout", 45)) * 2 + 30)
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=limit)
         return p.returncode, (p.stdout + p.stderr).strip()
     except subprocess.TimeoutExpired as e:
         out = ((e.stdout or "") if isinstance(e.stdout, str) else "").strip()
-        return 124, f"Превышен таймаут конвертера (120 с). {out}".strip()
+        return 124, f"Превышен таймаут конвертера ({limit} с). {out}".strip()
 
 def caption_text(s):
     return (
@@ -140,6 +160,94 @@ def caption_text(s):
         f"Инверсия {'вкл' if s['invert'] else 'выкл'} · {s['mode']} · "
         f"{s['fit']} · кадров {s['frames']}\nНастройте и нажмите «✅ Загрузить»"
     )
+
+def new_session(cfg, name, src) -> dict:
+    """Default animation session state for one chat."""
+    fits = list(cfg.fits) or ["contain"]
+    frames = [int(x) for x in (cfg.frames or [10])]
+    return {
+        "name": name or "animation",
+        "src": str(src),
+        "dir": str(Path(src).parent),
+        "mode": "auto",
+        "fill": 0.35,
+        "fit": fits[0],
+        "frames": frames[1] if len(frames) > 1 else frames[0],
+        "invert": False,
+        "msg_id": None,
+        "created": time.time(),
+    }
+
+def close_session(sessions, chat) -> bool:
+    """Drop a session and delete its temporary directory."""
+    s = sessions.pop(chat, None)
+    if not s:
+        return False
+    work = str(s.get("dir") or "")
+    if work and work.startswith(tempfile.gettempdir()):
+        shutil.rmtree(work, ignore_errors=True)
+    return True
+
+def purge_sessions(sessions, ttl=3600, now=None) -> int:
+    """Close sessions older than ttl seconds so memory stays bounded."""
+    now = float(now if now is not None else time.time())
+    stale = [c for c, s in list(sessions.items()) if now - float(s.get("created") or 0) > float(ttl)]
+    for chat in stale:
+        close_session(sessions, chat)
+    return len(stale)
+
+def media_ref(msg):
+    """Return (file_id, filename, size) for supported media in a message."""
+    for attr, fallback in (("animation", "animation.gif"), ("video", "video.mp4"), ("document", "file.bin")):
+        item = getattr(msg, attr, None)
+        if item is not None:
+            name = getattr(item, "file_name", None) or fallback
+            return item.file_id, name, int(getattr(item, "file_size", 0) or 0)
+    photos = getattr(msg, "photo", None)
+    if photos:
+        best = photos[-1]
+        return best.file_id, "photo.jpg", int(getattr(best, "file_size", 0) or 0)
+    return None, None, 0
+
+async def start_session(bot, cfg, msg, chat, sessions):
+    """Download media from a Telegram message and open a preview session."""
+    file_id, filename, size = media_ref(msg)
+    if not file_id:
+        await bot.send_message(chat, "Пришлите GIF, фото или видео.")
+        return False
+
+    ext = Path(filename or "").suffix.lower()
+    if ext and ext not in SUPPORTED_MEDIA_EXT:
+        await bot.send_message(chat, f"Формат {ext} не поддерживается. Пришлите GIF, фото или видео.")
+        return False
+    if size and size > MAX_MEDIA_BYTES:
+        await bot.send_message(chat, f"Файл больше {MAX_MEDIA_BYTES // (1024 * 1024)} МБ. Пришлите файл меньше.")
+        return False
+
+    purge_sessions(sessions, getattr(cfg, "session_ttl_seconds", 3600))
+    close_session(sessions, chat)
+
+    work = Path(tempfile.mkdtemp(prefix=f"tgbot_anim_{chat}_"))
+    dst = work / (Path(filename or "media").name or "media")
+    try:
+        await bot.download(file_id, destination=str(dst))
+    except Exception as e:
+        shutil.rmtree(work, ignore_errors=True)
+        eid = await errorlog.register_async(cfg, "telegram", f"download failed: {e}", repr(e), filename=filename)
+        await bot.send_message(chat, f"❌ Не удалось скачать файл #{eid}: {e}")
+        return False
+
+    if not dst.exists() or dst.stat().st_size == 0:
+        shutil.rmtree(work, ignore_errors=True)
+        await bot.send_message(chat, "❌ Файл пустой. Пришлите другой.")
+        return False
+
+    s = new_session(cfg, Path(filename or dst.name).stem, dst)
+    sessions[chat] = s
+    if not await refresh_preview(bot, cfg, chat, s):
+        close_session(sessions, chat)
+        return False
+    return True
 
 async def refresh_preview(bot, cfg, chat, s):
     from .ui import preview_kb
@@ -234,6 +342,16 @@ async def apply_session(bot, cfg, chat, s, pc, safety):
         save_index(cfg, idx)
         regen_stop_all(cfg, idx)
         regen_autostart(cfg, idx)
+
+        # Re-check state: a print may have started while the file was converting.
+        ok, reason = await safety.require_idle(pc)
+        if not ok:
+            rollback_anims(cfg, backup)
+            old = load_index(cfg)
+            regen_stop_all(cfg, old)
+            regen_autostart(cfg, old)
+            await bot.send_message(chat, f"❌ Принтер занят — выполнен откат: {reason}")
+            return False
 
         await bot.send_message(chat, "Перезапускаю Klipper…")
         ready, err = await restart_and_wait(pc)
