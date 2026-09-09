@@ -252,7 +252,7 @@ patch_printer_cfg() {
     warn "printer.cfg не найден ($PRINTER_CFG), include не добавлен"
     return 0
   fi
-  if grep -qE '^\\[include[[:space:]]+anims/\\*\\.cfg\\]' "$PRINTER_CFG"; then
+  if grep -qF '[include anims/*.cfg]' "$PRINTER_CFG"; then
     log "include анимаций уже есть"
     return 0
   fi
@@ -264,7 +264,7 @@ patch_printer_cfg() {
     warn "printer.cfg не разбирается парсером до правки, проверку после правки пропускаю"
   fi
 
-  printf '\\n[include anims/*.cfg]\\n' >> "$PRINTER_CFG"
+  printf '\n[include anims/*.cfg]\n' >> "$PRINTER_CFG"
 
   if (( was_valid )) && ! check_klipper_cfg "$PRINTER_CFG" >/dev/null 2>&1; then
     cp -a "$BACKUP_DIR/printer.cfg" "$PRINTER_CFG"
