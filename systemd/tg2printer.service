@@ -2,6 +2,9 @@
 Description=Telegram bot -> Klipper remote control
 After=network-online.target moonraker.service
 Wants=network-online.target
+# Audit P1-8: Restart=always without a start limit restarts a broken bot forever.
+StartLimitIntervalSec=300
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -12,8 +15,6 @@ ExecStart=/opt/tgbot/bin/python -m tgbot.main
 Restart=always
 RestartSec=5
 TimeoutStopSec=15
-
-# Defence-in-depth while keeping compatibility with the existing root install.
 NoNewPrivileges=true
 PrivateTmp=false
 ProtectSystem=strict
