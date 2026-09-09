@@ -1,0 +1,32 @@
+[Unit]
+Description=Telegram bot -> Klipper remote control
+After=network-online.target moonraker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/tgbot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/tgbot/bin/python -m tgbot.main
+Restart=always
+RestartSec=5
+TimeoutStopSec=15
+
+# Defence-in-depth while keeping compatibility with the existing root install.
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+ReadWritePaths=/root/tgbot /root/printer_data/config /tmp
+ReadWritePaths=-/var/log/tg2printer.log
+
+[Install]
+WantedBy=multi-user.target

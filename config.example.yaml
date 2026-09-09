@@ -1,0 +1,46 @@
+# Example configuration for tg2printer.
+# Copy to /root/tgbot/config.yaml and fill in the two required values.
+#
+#   bot_token        - token from @BotFather
+#   allowed_user_ids - Telegram user IDs allowed to control the printer
+#
+config_version: 5
+
+bot_token: "PUT-YOUR-BOT-TOKEN-HERE"
+allowed_user_ids: [123456789]
+notify_chat: 123456789
+
+moonraker: "http://127.0.0.1:7125"
+camera_url: "http://127.0.0.1:8080/?action=snapshot"
+config_dir: "/root/printer_data/config"
+converter: "/root/gif2klipper.py"
+
+# NOTE (audit P0-2): the v2.5.7 installer writes "python3" here, but Pillow is
+# installed only inside the bot virtualenv, so every animation conversion fails
+# with "Нужен Pillow". Use the venv interpreter instead.
+python: "/opt/tgbot/bin/python"
+
+max_glyphs: 250
+preview_base: "/tmp/tg_preview"
+backup_dir: "/root/tgbot/backups/animations"
+error_db: "/root/tgbot/errors.db"
+
+xy_steps: [1, 5, 10, 50]
+z_steps: [0.1, 0.5, 1, 5]
+move_default: {xy: 10, z: 1}
+fits: [contain, cover, stretch]
+frames: [5, 10, 15, 20]
+
+quiet_hours: {start: 23, end: 7}
+log_file: "/var/log/tg2printer.log"
+log_level: "INFO"
+
+power_actions_require_confirmation: true
+dangerous_macros_require_confirmation: true
+
+animation_backup_keep: 5
+max_error_log_lines: 180
+animation_max_input_frames: 500
+animation_max_input_pixels: 12000000
+animation_max_duration_ms: 120000
+animation_ffmpeg_timeout: 45
