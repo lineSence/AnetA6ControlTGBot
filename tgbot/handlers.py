@@ -1,5 +1,5 @@
 from __future__ import annotations
-import asyncio, hashlib, logging, os, shutil, time
+import asyncio, hashlib, logging, os, re, shutil, time
 from aiogram import Router, F
 from aiogram.types import Message, CallbackQuery, ErrorEvent
 from aiogram.exceptions import TelegramRetryAfter
@@ -19,10 +19,15 @@ MOVE_BY_CHAT = {}
 DIAG = {"started": time.time(), "last_error": None, "last_error_id": None}
 SAFETY = Safety()
 
-DANGEROUS_MACRO_WORDS = (
+# Whole-word tokens plus name prefixes. Substring matching gave false hits.
+DANGEROUS_MACRO_TOKENS = frozenset({
     "G28", "SAVE_CONFIG", "FIRMWARE_RESTART", "RESTART", "M112",
-    "BED_MESH", "PID_CALIBRATE", "PROBE_", "TESTZ", "SHUTDOWN"
-)
+    "BED_MESH", "PID_CALIBRATE", "TESTZ", "SHUTDOWN",
+})
+DANGEROUS_MACRO_PREFIXES = ("PROBE_", "BED_MESH", "PID_CALIBRATE", "TESTZ")
+
+# Telegram rejects messages longer than 4096 characters.
+TG_TEXT_LIMIT = 3800
 
 def chat_lock(c):
     if c not in LOCKS: LOCKS[c] = asyncio.Lock()
@@ -42,8 +47,86 @@ def macro_digest(name):
     return hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
 
 def macro_is_dangerous(name: str) -> bool:
-    upper = name.upper()
-    return any(word in upper for word in DANGEROUS_MACRO_WORDS)
+    """Match whole name parts. PRESTART stays safe, MY_G28_MACRO does not."""
+    upper = str(name or "").upper()
+    if upper.startswith(DANGEROUS_MACRO_PREFIXES):
+        return True
+    return any(
+        re.search(rf"(?:^|[^A-Z0-9]){re.escape(token)}(?:$|[^A-Z0-9])", upper)
+        for token in DANGEROUS_MACRO_TOKENS
+    )
+
+def allowed(cfg, user) -> bool:
+    """Reject updates without a user: channel posts and anonymous admins."""
+    return bool(user) and getattr(user, "id", None) in cfg.allowed_user_ids
+
+def chunk_text(text, size=TG_TEXT_LIMIT):
+    """Split text so every part fits into one Telegram message."""
+    text = str(text or "")
+    if not text:
+        return [""]
+    parts, buf, length = [], [], 0
+    for line in text.splitlines(keepends=True):
+        while len(line) > size:
+            if buf:
+                parts.append("".join(buf)); buf, length = [], 0
+            parts.append(line[:size])
+            line = line[size:]
+        if length + len(line) > size and buf:
+            parts.append("".join(buf)); buf, length = [], 0
+        buf.append(line); length += len(line)
+    if buf:
+        parts.append("".join(buf))
+    return parts or [""]
+
+async def send_long(target, text, **kwargs):
+    """Send long text as several messages instead of failing."""
+    for part in chunk_text(text):
+        await target(part, **kwargs)
+
+def set_pending(chat, payload):
+    """Store a confirmation with a timestamp."""
+    payload["ts"] = time.time()
+    PENDING[chat] = payload
+    return payload
+
+def take_pending(chat, kind, max_age=None):
+    """Pop a confirmation and check its kind and age."""
+    p = PENDING.pop(chat, None)
+    if not p or p.get("kind") != kind:
+        return None
+    if max_age and time.time() - float(p.get("ts") or 0) > float(max_age):
+        return None
+    return p
+
+def purge_state(cfg=None, now=None) -> int:
+    """Drop stale confirmations, rename prompts, sessions and locks."""
+    now = float(now if now is not None else time.time())
+    pending_ttl = float(getattr(cfg, "pending_ttl_seconds", 900) or 900)
+    session_ttl = float(getattr(cfg, "session_ttl_seconds", 3600) or 3600)
+    removed = 0
+    for chat, p in list(PENDING.items()):
+        if now - float((p or {}).get("ts") or 0) > pending_ttl:
+            PENDING.pop(chat, None); removed += 1
+    for chat, r in list(RENAMING.items()):
+        if now - float((r or {}).get("ts") or 0) > pending_ttl:
+            RENAMING.pop(chat, None); removed += 1
+    removed += anims.purge_sessions(SESSIONS, session_ttl, now)
+    for chat, lock in list(LOCKS.items()):
+        if not lock.locked() and chat not in PENDING and chat not in SESSIONS and chat not in RENAMING:
+            LOCKS.pop(chat, None)
+    return removed
+
+async def janitor_loop(cfg, interval=300):
+    """Background cleanup so per-chat dictionaries cannot grow forever."""
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            purge_state(cfg)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("janitor failed")
 
 async def show(cq, bot, text, kbc):
     try:
@@ -119,12 +202,12 @@ async def history_text(pc):
 
 @router.message(F.text)
 async def on_text(msg: Message, bot, pc, cfg, ws):
-    if msg.from_user.id not in cfg.allowed_user_ids: return
+    if not allowed(cfg, msg.from_user): return
     chat = msg.chat.id
 
     if chat in RENAMING:
         idx = anims.load_index(cfg)
-        p = RENAMING.pop(chat)
+        p = (RENAMING.pop(chat) or {}).get("prefix")
         it = next((x for x in idx["items"] if x["prefix"] == p), None)
         if it:
             it["name"] = msg.text.strip()[:40] or "Анимация"
@@ -142,7 +225,7 @@ async def on_text(msg: Message, bot, pc, cfg, ws):
     elif t == "/diag":
         await msg.answer(await diag_text(pc, ws, cfg))
     elif t == "/errors":
-        await msg.answer(await errors_text(cfg))
+        await send_long(msg.answer, await errors_text(cfg))
     elif t.startswith("/error"):
         parts = t.split()
         if len(parts) != 2 or not parts[1].isdigit():
@@ -153,7 +236,8 @@ async def on_text(msg: Message, bot, pc, cfg, ws):
                 await msg.answer("Ошибка не найдена.")
             else:
                 eid,ts,source,state,filename,message,details,ack = row
-                await msg.answer(
+                await send_long(
+                    msg.answer,
                     f"🚨 Ошибка #{eid}\n🕒 {ts}\nИсточник: {source}\n"
                     f"Состояние: {state or '—'}\n📄 {filename or '—'}\n"
                     f"❌ {message}\n\nЛог:\n{(details or '—')[-6000:]}"
@@ -167,9 +251,9 @@ async def on_text(msg: Message, bot, pc, cfg, ws):
             "GIF/фото — анимация · .gcode — загрузка"
         )
 
-@router.message(F.animation | F.photo | F.document)
+@router.message(F.animation | F.photo | F.video | F.document)
 async def on_media(msg: Message, bot, pc, cfg):
-    if msg.from_user.id not in cfg.allowed_user_ids: return
+    if not allowed(cfg, msg.from_user): return
     if msg.document:
         fn = (msg.document.file_name or "").lower()
         if fn.endswith((".gcode",".g",".gc",".ngc")):
@@ -194,7 +278,7 @@ async def handle_gcode_upload(bot, msg, pc, cfg):
         item = r.result.get("item", {}) if isinstance(r.result, dict) else {}
         sz = fmt_size(item.get("size",0)) if isinstance(item, dict) else ""
         log.info("gcode uploaded: %s (%s)", safe_name, sz)
-        PENDING[msg.chat.id] = {"kind":"gcode", "filename":safe_name}
+        set_pending(msg.chat.id, {"kind":"gcode", "filename":safe_name})
         await bot.send_message(
             msg.chat.id,
             f"📦 Загружено: {safe_name} · {sz}",
@@ -220,8 +304,11 @@ def _macro_from_data(data):
 
 @router.callback_query()
 async def on_cb(cq: CallbackQuery, bot, pc, cfg, ws):
-    if cq.from_user.id not in cfg.allowed_user_ids:
+    if not allowed(cfg, cq.from_user):
         await cq.answer()
+        return
+    if cq.message is None:
+        await cq.answer("Сообщение устарело")
         return
 
     chat, data = cq.message.chat.id, cq.data or ""
@@ -236,8 +323,8 @@ async def on_cb(cq: CallbackQuery, bot, pc, cfg, ws):
         if a == "noop":
             await cq.answer(); return
         if a == "cancel":
-            SESSIONS.pop(chat, None)
             clear_temp_file(s.get("src"))
+            anims.close_session(SESSIONS, chat)
             if s.get("msg_id"):
                 try: await bot.delete_message(chat, s["msg_id"])
                 except Exception: pass
@@ -247,8 +334,8 @@ async def on_cb(cq: CallbackQuery, bot, pc, cfg, ws):
             await cq.answer()
             async with chat_lock(chat):
                 ok = await anims.apply_session(bot, cfg, chat, s, pc, SAFETY)
-            SESSIONS.pop(chat, None)
             clear_temp_file(s.get("src"))
+            anims.close_session(SESSIONS, chat)
             if not ok and s.get("last_error_id"):
                 DIAG["last_error_id"] = s["last_error_id"]
             return
@@ -286,7 +373,7 @@ async def on_cb(cq: CallbackQuery, bot, pc, cfg, ws):
         return
 
     if data.startswith("ren:"):
-        RENAMING[chat] = data.split(":",1)[1]
+        RENAMING[chat] = {"prefix": data.split(":",1)[1], "ts": time.time()}
         await cq.answer()
         await bot.send_message(chat, "Пришлите новое имя анимации.")
         return
@@ -365,9 +452,11 @@ async def on_cb(cq: CallbackQuery, bot, pc, cfg, ws):
             i = int(idx_s)
         except Exception:
             await cq.answer("Некорректная команда"); return
-        pending = PENDING.pop(chat, None)
-        if not pending or pending.get("kind") != "macro":
+        pending = take_pending(chat, "macro", getattr(cfg, "pending_ttl_seconds", 900))
+        if not pending:
             await cq.answer("Подтверждение устарело"); return
+        if int(pending.get("index", -1)) != i or pending.get("digest") != digest:
+            await cq.answer("Подтверждение не совпадает — откройте меню заново"); return
         macros = await pc.macros()
         if i >= len(macros) or macro_digest(macros[i]) != digest:
             await cq.answer("Макрос изменился — откройте меню заново"); return
@@ -394,7 +483,7 @@ async def on_cb(cq: CallbackQuery, bot, pc, cfg, ws):
         await cq.answer()
         name = macros[i]
         if cfg.dangerous_macros_require_confirmation and macro_is_dangerous(name):
-            PENDING[chat] = {"kind":"macro","index":i,"digest":digest,"name":name}
+            set_pending(chat, {"kind":"macro","index":i,"digest":digest,"name":name})
             await show(cq, bot, f"⚠️ Потенциально опасный макрос: {name}",
                        kb([[("✅ Выполнить",f"mc:run:{i}:{digest}"),("❌ Отмена","m:macros")]]))
             return
@@ -424,16 +513,16 @@ async def on_cb(cq: CallbackQuery, bot, pc, cfg, ws):
         if k >= len(items):
             await cq.answer("Список устарел"); return
         filename = items[k][1]
-        PENDING[chat] = {"kind":"file","filename":filename}
+        set_pending(chat, {"kind":"file","filename":filename})
         await cq.answer()
         await show(cq, bot, f"Запустить «{filename}»?",
                    kb([[("✅ Старт","f:start"),("⬅️ Назад","m:files:0")]]))
         return
 
     if data == "f:start" or data == "g:start":
-        p = PENDING.pop(chat, None)
         expected = "file" if data == "f:start" else "gcode"
-        if not p or p.get("kind") != expected:
+        p = take_pending(chat, expected, getattr(cfg, "pending_ttl_seconds", 900))
+        if not p:
             await cq.answer("Список устарел"); return
         async with chat_lock(chat):
             ok, reason = await SAFETY.require_idle(pc)
@@ -608,12 +697,17 @@ async def on_cb(cq: CallbackQuery, bot, pc, cfg, ws):
             await _execute_power(cq, bot, pc, cfg, chat, a)
         else:
             await cq.answer()
+            set_pending(chat, {"kind": "power", "action": a})
             await show(cq, bot, f"Точно: {names[a]}?",
                        kb([[("✅ Да",f"p:do:{a}"),("⬅️ Назад","m:power")]]))
         return
 
     if data.startswith("p:do:"):
         a = data.split(":")[2]
+        if cfg.power_actions_require_confirmation:
+            p = take_pending(chat, "power", getattr(cfg, "pending_ttl_seconds", 900))
+            if not p or p.get("action") != a:
+                await cq.answer("Подтверждение устарело"); return
         await cq.answer()
         await _execute_power(cq, bot, pc, cfg, chat, a)
         return

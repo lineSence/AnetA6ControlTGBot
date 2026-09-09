@@ -16,8 +16,9 @@ from tgbot.anims import num_to_prefix
 def test_config_migration():
     old = {"backup_dir": "/tmp/anims_backup"}
     new = _migrate(old)
-    assert new["config_version"] == 5
+    assert new["config_version"] == 6
     assert new["backup_dir"] == "/root/tgbot/backups/animations"
+    assert new["python"] == "/opt/tgbot/bin/python"
     assert new["error_db"] == "/root/tgbot/errors.db"
     assert new["quiet_hours"] == {"start": 23, "end": 7}
 
