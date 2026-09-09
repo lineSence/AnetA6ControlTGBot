@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 import yaml
 
-CURRENT_CONFIG_VERSION = 5
+CURRENT_CONFIG_VERSION = 6
 
 DEFAULTS: dict[str, Any] = {
     "config_version": CURRENT_CONFIG_VERSION,
@@ -16,7 +16,7 @@ DEFAULTS: dict[str, Any] = {
     "camera_url": "http://127.0.0.1:8080/?action=snapshot",
     "config_dir": "/root/printer_data/config",
     "converter": "/root/gif2klipper.py",
-    "python": "python3",
+    "python": "/opt/tgbot/bin/python",
     "max_glyphs": 250,
     "preview_base": "/tmp/tg_preview",
     "backup_dir": "/root/tgbot/backups/animations",
@@ -37,6 +37,13 @@ DEFAULTS: dict[str, Any] = {
     "animation_max_input_pixels": 12000000,
     "animation_max_duration_ms": 120000,
     "animation_ffmpeg_timeout": 45,
+    "moonraker_api_key": "",
+    "http_timeout": 15,
+    "upload_timeout": 300,
+    "error_log_keep": 500,
+    "critical_alerts_ignore_quiet_hours": True,
+    "pending_ttl_seconds": 900,
+    "session_ttl_seconds": 3600,
 }
 
 @dataclass(slots=True)
@@ -70,6 +77,13 @@ class Config:
     animation_max_input_pixels: int = 12000000
     animation_max_duration_ms: int = 120000
     animation_ffmpeg_timeout: int = 45
+    moonraker_api_key: str = ""
+    http_timeout: int = 15
+    upload_timeout: int = 300
+    error_log_keep: int = 500
+    critical_alerts_ignore_quiet_hours: bool = True
+    pending_ttl_seconds: int = 900
+    session_ttl_seconds: int = 3600
 
 def as_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, bool):
@@ -115,6 +129,18 @@ def _migrate(data: dict[str, Any]) -> dict[str, Any]:
         data.setdefault("animation_ffmpeg_timeout", 45)
         version = 5
 
+    if version < 6:
+        if str(data.get("python") or "").strip() in {"", "python", "python3", "/usr/bin/python", "/usr/bin/python3"}:
+            data["python"] = "/opt/tgbot/bin/python"
+        data.setdefault("moonraker_api_key", "")
+        data.setdefault("http_timeout", 15)
+        data.setdefault("upload_timeout", 300)
+        data.setdefault("error_log_keep", 500)
+        data.setdefault("critical_alerts_ignore_quiet_hours", True)
+        data.setdefault("pending_ttl_seconds", 900)
+        data.setdefault("session_ttl_seconds", 3600)
+        version = 6
+
     data["config_version"] = CURRENT_CONFIG_VERSION
     return data
 
@@ -141,6 +167,9 @@ def load(path: str | None = None) -> Config:
     token = os.environ.get("TG_BOT_TOKEN")
     if token:
         merged["bot_token"] = token
+    api_key = os.environ.get("MOONRAKER_API_KEY")
+    if api_key:
+        merged["moonraker_api_key"] = api_key
 
     c = Config(
         config_version=int(merged.get("config_version", CURRENT_CONFIG_VERSION)),
@@ -172,6 +201,13 @@ def load(path: str | None = None) -> Config:
         animation_max_input_pixels=max(1, int(merged["animation_max_input_pixels"])),
         animation_max_duration_ms=max(1000, int(merged["animation_max_duration_ms"])),
         animation_ffmpeg_timeout=max(5, int(merged["animation_ffmpeg_timeout"])),
+        moonraker_api_key=str(merged.get("moonraker_api_key") or ""),
+        http_timeout=max(5, int(merged["http_timeout"])),
+        upload_timeout=max(30, int(merged["upload_timeout"])),
+        error_log_keep=max(50, int(merged["error_log_keep"])),
+        critical_alerts_ignore_quiet_hours=as_bool(merged["critical_alerts_ignore_quiet_hours"], True),
+        pending_ttl_seconds=max(60, int(merged["pending_ttl_seconds"])),
+        session_ttl_seconds=max(300, int(merged["session_ttl_seconds"])),
     )
     if c.notify_chat is None and c.allowed_user_ids:
         c.notify_chat = sorted(c.allowed_user_ids)[0]

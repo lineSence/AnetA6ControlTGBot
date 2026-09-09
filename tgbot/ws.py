@@ -8,12 +8,21 @@ from .ui import progress_bar
 
 log = logging.getLogger("tgbot")
 
+WS_BASE_BACKOFF = 3
+WS_MAX_BACKOFF = 60
+
 def is_quiet(cfg):
     q = cfg.quiet_hours or {}
     s, e = int(q.get("start", 23)), int(q.get("end", 7))
     if s == e: return False
     h = datetime.now().hour
     return (h >= s or h < e) if s > e else (s <= h < e)
+
+def should_notify(cfg, critical: bool = False) -> bool:
+    """Quiet hours mute routine messages. Critical alerts always go out."""
+    if critical and getattr(cfg, "critical_alerts_ignore_quiet_hours", True):
+        return True
+    return not is_quiet(cfg)
 
 class MoonrakerWS:
     def __init__(self, cfg, bot):
@@ -34,6 +43,7 @@ class MoonrakerWS:
         self.reconnects = 0
         self.last_event = 0.0
         self.last_error = None
+        self.backoff = 0
 
     async def run(self):
         while True:
@@ -43,6 +53,7 @@ class MoonrakerWS:
                     async with s.ws_connect(self.ws_url, heartbeat=30) as ws:
                         self.connected = True
                         self.last_error = None
+                        self.backoff = 0
                         await ws.send_json({
                             "jsonrpc": "2.0",
                             "method": "printer.objects.subscribe",
@@ -66,7 +77,10 @@ class MoonrakerWS:
                 log.warning("ws error: %s", e)
             finally:
                 self.connected = False
-            await asyncio.sleep(3)
+            delay = min(WS_MAX_BACKOFF, WS_BASE_BACKOFF * (2 ** min(self.backoff, 5)))
+            self.backoff += 1
+            log.info("ws reconnect in %s s", delay)
+            await asyncio.sleep(delay)
 
     def live_text(self):
         rem = ""
@@ -138,7 +152,7 @@ class MoonrakerWS:
 
             if self.state == "printing":
                 b = int(self.frac * 100) // 25
-                if b > self.snap_bucket and b < 4 and not is_quiet(self.cfg):
+                if b > self.snap_bucket and b < 4 and should_notify(self.cfg):
                     self.snap_bucket = b
                     await self.send_cam(f"📷 {b*25}%")
 
@@ -146,12 +160,12 @@ class MoonrakerWS:
             await self._register_klippy_event("shutdown", "Klippy shutdown")
 
         elif data.get("method") == "notify_klippy_disconnected":
-            if not is_quiet(self.cfg):
+            if should_notify(self.cfg, critical=True):
                 await self.bot.send_message(self.cfg.notify_chat, "🔌 Klipper отключился")
             await self._register_klippy_event("disconnected", "Klipper disconnected")
 
         elif data.get("method") == "notify_klippy_ready":
-            if not is_quiet(self.cfg):
+            if should_notify(self.cfg, critical=True):
                 await self.bot.send_message(self.cfg.notify_chat, "✅ Klipper готов")
 
     def _apply_status(self, status):
@@ -172,7 +186,7 @@ class MoonrakerWS:
         await errorlog.register_async(
             self.cfg, "klipper", reason, details, state=state, filename=self.filename or None
         )
-        if state == "shutdown" and not is_quiet(self.cfg):
+        if state == "shutdown" and should_notify(self.cfg, critical=True):
             await self.bot.send_message(self.cfg.notify_chat, f"🛑 Klipper остановлен: {reason}")
 
     async def on_state(self, prev, state, fname):
@@ -204,6 +218,7 @@ class MoonrakerWS:
             else:
                 await self.edit_live(f"⛔ Печать отменена: {fname}")
             self.live = None
+
 async def health_loop(pc, bot, cfg, ws):
     """Background Moonraker health monitor used by main.py."""
     fails = 0
@@ -219,7 +234,7 @@ async def health_loop(pc, bot, cfg, ws):
             log.debug("health check failed: %s", exc)
 
         if ok:
-            if alerted and not is_quiet(cfg):
+            if alerted and should_notify(cfg, critical=True):
                 try:
                     await bot.send_message(cfg.notify_chat, "✅ Moonraker снова на связи")
                 except Exception:
@@ -228,7 +243,7 @@ async def health_loop(pc, bot, cfg, ws):
             fails = 0
         else:
             fails += 1
-            if fails >= 3 and not alerted and not is_quiet(cfg):
+            if fails >= 3 and not alerted and should_notify(cfg, critical=True):
                 try:
                     await bot.send_message(cfg.notify_chat, "🚫 Moonraker/Klipper недоступен")
                 except Exception:
@@ -236,4 +251,3 @@ async def health_loop(pc, bot, cfg, ws):
                 alerted = True
 
         await asyncio.sleep(10)
-

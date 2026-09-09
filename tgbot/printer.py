@@ -50,13 +50,32 @@ def upload_ok(r: Any):
     )
 
 class PrinterClient:
-    def __init__(self, base: str):
+    def __init__(self, base: str, api_key: str = "", timeout: int = 15, upload_timeout: int = 300):
         self.base = base.rstrip("/")
+        self.api_key = str(api_key or "")
+        self.timeout = max(5, int(timeout))
+        self.upload_timeout = max(30, int(upload_timeout))
         self._s: aiohttp.ClientSession | None = None
+
+    @classmethod
+    def from_config(cls, cfg):
+        """Build a client from Config: API key and both timeouts come from there."""
+        return cls(
+            cfg.moonraker,
+            api_key=getattr(cfg, "moonraker_api_key", ""),
+            timeout=getattr(cfg, "http_timeout", 15),
+            upload_timeout=getattr(cfg, "upload_timeout", 300),
+        )
+
+    def _headers(self):
+        return {"X-Api-Key": self.api_key} if self.api_key else {}
 
     async def session(self):
         if self._s is None or self._s.closed:
-            self._s = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15))
+            self._s = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=self.timeout),
+                headers=self._headers(),
+            )
         return self._s
 
     async def close(self):
@@ -122,7 +141,11 @@ class PrinterClient:
             d = aiohttp.FormData()
             with open(path, "rb") as fh:
                 d.add_field("file", fh, filename=filename)
-                async with s.post(self.base + "/server/files/upload", data=d) as r:
+                async with s.post(
+                    self.base + "/server/files/upload",
+                    data=d,
+                    timeout=aiohttp.ClientTimeout(total=self.upload_timeout),
+                ) as r:
                     payload = await r.json(content_type=None)
                     err = _error_text(payload)
                     if r.status < 200 or r.status >= 300 or err:
