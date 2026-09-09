@@ -16,7 +16,7 @@ Telegram-бот для удалённого управления 3D-принте
 - **Файлы.** Список G-code, запуск печати, загрузка нового файла прямо из чата.
 - **Перемещение осей.** Кнопки XY и Z с настраиваемым шагом, парковка осей.
 - **Макросы.** Список макросов Klipper с подтверждением опасных команд.
-- **Анимации дисплея.** Конвертация GIF, фото и видео в `display_data` для экрана принтера. Предпросмотр, бэкап, откат.
+- **Анимации дисплея.** Конвертация GIF, фото и видео в `display_data` для экрана принтера. Предпросмотр, бекап, откат.
 - **Журнал ошибок.** Ошибки Klipper пишутся в SQLite с номером. Просмотр из чата командой `/error <id>`.
 - **Тихие часы.** Ночью бот не шлёт уведомления.
 
@@ -31,7 +31,7 @@ Telegram-бот для удалённого управления 3D-принте
 | `tgbot/printer.py` | 142 | HTTP-клиент Moonraker: статус, файлы, макросы, загрузка G-code. |
 | `tgbot/ws.py` | 239 | WebSocket Moonraker: живое сообщение, уведомления, health-loop. |
 | `tgbot/safety.py` | 72 | Правила блокировки опасных действий во время печати. |
-| `tgbot/anims.py` | 278 | Сессии анимаций, вызов конвертера, бэкап и откат `anims/`. |
+| `tgbot/anims.py` | 278 | Сессии анимаций, вызов конвертера, бекап и откат `anims/`. |
 | `tgbot/errorlog.py` | 88 | Журнал ошибок в SQLite, чтение хвоста `klippy.log`. |
 | `tgbot/logsetup.py` | 22 | Ротация файлового лога и вывод в journald. |
 | `gif2klipper.py` | 872 | Автономный конвертер изображений и видео в конфиг Klipper. |
@@ -46,28 +46,34 @@ Telegram  <--aiogram-->  handlers  -->  printer (HTTP)  -->  Moonraker  -->  Kli
      ws.py  <--WebSocket--  Moonraker   (статус печати, ошибки, уведомления)
 ```
 
+Подробное устройство: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 ## Структура репозитория
 
 ```text
-tgbot/                    пакет бота
-gif2klipper.py            конвертер анимаций (ставится в /root/gif2klipper.py)
-tests/                    тесты pytest
-scripts/check.sh          локальная проверка перед релизом
+tgbot/                     пакет бота (10 модулей)
+gif2klipper.py             конвертер анимаций (ставится в /root/gif2klipper.py)
+tests/                     тесты pytest
+scripts/install.sh         установщик из репозитория
+scripts/check.sh           локальная проверка перед релизом
 systemd/tg2printer.service шаблон systemd-юнита
-config.example.yaml       шаблон конфигурации
-requirements.lock         закреплённые версии зависимостей
-docs/                     проектная документация
-  AUDIT.md                отчёт аудита версии 2.5.7
-  ARCHITECTURE.md         устройство системы
-  INSTALL.md              установка и обновление
-  CONFIGURATION.md        описание всех ключей конфигурации
-  ROADMAP.md              план исправления дефектов
+config.example.yaml        шаблон конфигурации
+requirements.lock          закреплённые версии зависимостей
+pyproject.toml             настройки pytest
+ci/ci.yml                  пайплайн GitHub Actions (нужно перенести вручную)
+CHANGELOG.md               история изменений и отличия от версии 2.5.7
+docs/                      проектная документация
+  AUDIT.md                 отчёт аудита версии 2.5.7
+  ARCHITECTURE.md          устройство системы
+  INSTALL.md               установка и обновление
+  CONFIGURATION.md         описание всех ключей конфигурации
+  ROADMAP.md               план исправления дефектов
 ```
 
 ## Требования
 
 - Хост с Klipper и Moonraker (Raspberry Pi или аналог).
-- Python 3.11 или новее.
+- Python 3.10 или новее, пакет `python3-venv`.
 - `ffmpeg` для конвертации видео.
 - Токен Telegram-бота от [@BotFather](https://t.me/BotFather).
 - Ваш Telegram user id.
@@ -77,10 +83,11 @@ docs/                     проектная документация
 ```bash
 git clone https://github.com/lineSence/AnetA6ControlTGBot.git
 cd AnetA6ControlTGBot
-sudo bash scripts/install.sh
+sudo bash scripts/install.sh --token <BOT_TOKEN> --chat <TELEGRAM_ID>
 ```
 
 Установщик создаёт окружение `/opt/tgbot`, копирует пакет в `/root/tgbot`, ставит юнит `tg2printer` и добавляет `[include anims/*.cfg]` в `printer.cfg`.
+Перед установкой он бекапит предыдущую версию и гоняет тесты.
 Подробности и ручная установка: [docs/INSTALL.md](docs/INSTALL.md).
 
 ## Конфигурация
@@ -105,6 +112,19 @@ python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.lock
 PYTHONPATH=. pytest tests -q
 bash scripts/check.sh      # запускать на хосте принтера
+```
+
+Тест `tests/test_converter.py` ищет конвертер по жёсткому пути `/root/gif2klipper.py`. На машине разработчика скопируйте файл туда или пропустите этот тест.
+
+## Непрерывная интеграция
+
+Пайплайн лежит в `ci/ci.yml`: он гоняет `pytest` на Python 3.12 и `shellcheck` для скриптов.
+GitHub Actions читает только каталог `.github/workflows/`, поэтому включите его вручную:
+
+```bash
+mkdir -p .github/workflows
+git mv ci/ci.yml .github/workflows/ci.yml
+git commit -m "ci: enable workflow" && git push
 ```
 
 ## Результаты аудита (кратко)
