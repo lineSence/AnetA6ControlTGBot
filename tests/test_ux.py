@@ -1,13 +1,17 @@
-"""UX/UI tests for release 2.7.0.
+"""UX/UI tests for release 2.7.1.
 
 They lock the design system: screen zones, button limits, exits from every
 screen, empty states, middlewares and the command list.
+
+The event doubles below subclass the real aiogram models. aiogram types are
+pydantic models with required fields, so a double must fill them.
 """
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 from aiogram import Dispatcher
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, Chat, Message, User
 
 from tgbot import ui, uxkit
 from tgbot.config import CURRENT_CONFIG_VERSION, _migrate, load
@@ -70,26 +74,63 @@ def gcode_files(count):
     ]
 
 
-class FakeCQ(CallbackQuery):
-    def __init__(self, user_id=1, data="m:main"):
-        super().__init__()
-        self.from_user = SimpleNamespace(id=user_id)
-        self.data = data
-        self.answers = []
+FAKE_DATE = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
-    async def answer(self, text=None, show_alert=False):
+
+def fake_user(user_id=1):
+    """Real User model. The Bot API requires id, is_bot and first_name."""
+    return User(id=user_id, is_bot=False, first_name="Tester")
+
+
+class FakeCQ(CallbackQuery):
+    """Real callback query that records answer() instead of calling Telegram.
+
+    The middlewares choose the branch with isinstance, so the double has to be
+    a real CallbackQuery with every required field filled.
+    """
+
+    def __init__(self, user_id=1, data="m:main"):
+        super().__init__(
+            id="cb-1",
+            from_user=fake_user(user_id),
+            chat_instance="chat-instance-1",
+            data=data,
+        )
+        # The recorder is a test field, not a Bot API one: skip model validation.
+        object.__setattr__(self, "answers", [])
+
+    async def answer(self, text=None, show_alert=False, **kwargs):
         self.answers.append((text, bool(show_alert)))
 
 
 class FakeMsg(Message):
+    """Real message that records answer() instead of calling Telegram."""
+
     def __init__(self, user_id=1, text="/menu"):
-        super().__init__()
-        self.from_user = SimpleNamespace(id=user_id)
-        self.text = text
-        self.replies = []
+        super().__init__(
+            message_id=1,
+            date=FAKE_DATE,
+            chat=Chat(id=user_id, type="private"),
+            from_user=fake_user(user_id),
+            text=text,
+        )
+        object.__setattr__(self, "replies", [])
 
     async def answer(self, text, **kwargs):
         self.replies.append(text)
+
+
+def registered_middlewares(observer):
+    """Middlewares of an aiogram observer. The shape differs between versions."""
+    manager = getattr(observer, "middleware", None)
+    for attr in ("_middlewares", "middlewares"):
+        items = getattr(manager, attr, None)
+        if items is not None:
+            return list(items)
+    try:
+        return list(manager)
+    except TypeError:
+        return []
 
 
 def make_cfg(**over):
@@ -425,13 +466,27 @@ async def test_antiflood_allows_another_button():
     assert mw.dropped == 0
 
 
+def test_event_doubles_are_real_aiogram_types():
+    """Guard against doubles that only look like events."""
+    cq = FakeCQ(user_id=5, data="m:temp")
+    assert isinstance(cq, CallbackQuery)
+    assert (cq.from_user.id, cq.data) == (5, "m:temp")
+
+    msg = FakeMsg(user_id=6, text="/status")
+    assert isinstance(msg, Message)
+    assert (msg.from_user.id, msg.text) == (6, "/status")
+
+
 def test_setup_attaches_both_middlewares():
     dp = Dispatcher()
     access, flood = setup(dp, make_cfg())
     assert isinstance(access, AccessMiddleware)
     assert isinstance(flood, AntiFloodMiddleware)
-    assert len(dp.message.middlewares) == 2
-    assert len(dp.callback_query.middlewares) == 2
+    for observer in (dp.message, dp.callback_query):
+        items = registered_middlewares(observer)
+        assert access in items, "access middleware is not attached"
+        assert flood in items, "antiflood middleware is not attached"
+        assert items.index(access) < items.index(flood)
 
 
 # --- config --------------------------------------------------------------
