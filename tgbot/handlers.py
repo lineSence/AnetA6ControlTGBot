@@ -6,7 +6,15 @@ from aiogram.exceptions import TelegramRetryAfter
 from . import __version__, errorlog, anims
 from .printer import file_items, fmt_dur, fmt_size, MRResult
 from .safety import Safety
-from .ui import kb, cycle, main_kb, files_kb, macro_kb, temp_kb, move_kb, tune_kb, power_kb, anim_kb
+from .ui import (
+    HOME, anim_kb, confirm_kb, cycle, diag_kb, errors_kb, files_kb, help_kb,
+    history_kb, kb, macro_kb, main_kb, move_kb, nav_row, power_kb, status_kb,
+    temp_kb, tune_kb,
+)
+from .uxkit import (
+    ack, code, crumbs, esc, eta_seconds, field, is_allowed, pct, progress,
+    render, screen,
+)
 
 log = logging.getLogger("tgbot")
 router = Router()
@@ -57,8 +65,8 @@ def macro_is_dangerous(name: str) -> bool:
     )
 
 def allowed(cfg, user) -> bool:
-    """Reject updates without a user: channel posts and anonymous admins."""
-    return bool(user) and getattr(user, "id", None) in cfg.allowed_user_ids
+    """Same check as the access middleware. Kept as a second line of defence."""
+    return is_allowed(cfg, user)
 
 def chunk_text(text, size=TG_TEXT_LIMIT):
     """Split text so every part fits into one Telegram message."""
@@ -128,40 +136,378 @@ async def janitor_loop(cfg, interval=300):
         except Exception:
             log.exception("janitor failed")
 
-async def show(cq, bot, text, kbc):
-    try:
-        await cq.message.edit_text(text, reply_markup=kbc)
-    except Exception:
-        await bot.send_message(cq.message.chat.id, text, reply_markup=kbc)
+PATH_ROOT = "пульт"
+
+POWER_NAMES = {
+    "restart": "Restart Klipper",
+    "fw": "Firmware restart",
+    "reboot": "Reboot хоста",
+    "shutdown": "Shutdown хоста",
+}
+
+# Every destructive screen says what will happen, in plain words.
+POWER_IMPACT = {
+    "restart": "Klipper перезапустится. Активная печать прервётся.",
+    "fw": "Плата перезапустит прошивку. Активная печать прервётся.",
+    "reboot": "Хост перезагрузится. Бот пропадёт на одну-две минуты.",
+    "shutdown": "Хост выключится. Включить его можно только руками.",
+}
+
+HELP_TOPICS = {
+    "top": (
+        "❓ Помощь",
+        [
+            "Бот управляет принтером через Moonraker.",
+            "Главный способ работы — кнопки. Команды нужны для быстрого доступа:",
+            "",
+            "/menu · /status · /files · /anims · /errors · /diag · /help",
+            "",
+            "Выберите тему ниже.",
+        ],
+    ),
+    "print": (
+        "📂 Как напечатать файл",
+        [
+            "1. Пришлите файл .gcode в этот чат.",
+            "2. Я загружу его в Moonraker и покажу кнопку «Печатать».",
+            "3. Подтвердите запуск — печать начнётся сразу.",
+            "",
+            "Файлы, уже загруженные в Moonraker, лежат в разделе «Файлы».",
+            "Во время печати в меню появляются «Пауза» и «Отменить».",
+        ],
+    ),
+    "anims": (
+        "🎬 Анимации на экране",
+        [
+            "1. Пришлите GIF, фото или короткое видео.",
+            "2. Настройте заливку, инверсию и число кадров кнопками.",
+            "3. Нажмите «Загрузить» — я соберу конфиг и перезапущу Klipper.",
+            "",
+            "⭐ помечает анимацию, которая включается при старте.",
+            "Во время печати менять анимации нельзя.",
+        ],
+    ),
+    "temp": (
+        "🌡 Нагрев",
+        [
+            "Кнопки-пресеты задают целевую температуру сразу.",
+            "Ноль выключает нагрев. «Остудить всё» гасит и хотенд, и стол.",
+            "",
+            "Первая цифра — температура сейчас, вторая — цель.",
+        ],
+    ),
+    "macros": (
+        "🧩 Макросы Klipper",
+        [
+            "Список берётся из printer.cfg автоматически.",
+            "Опасные макросы (G28, BED_MESH, PID_CALIBRATE и похожие) требуют подтверждения.",
+            "",
+            "Во время печати макросы блокируются.",
+        ],
+    ),
+    "safety": (
+        "🛡 Безопасность",
+        [
+            "🚨 Аварийный стоп срабатывает сразу, без подтверждения.",
+            "После него Klipper восстанавливают кнопкой в меню.",
+            "",
+            "Питание, удаление и опасные макросы требуют подтверждения.",
+            "Подтверждение живёт ограниченное время и отменяется само.",
+            "Доступ есть только у ID из allowed_user_ids.",
+        ],
+    ),
+}
+
+
+def path(*parts):
+    """Breadcrumbs for a screen: the user always sees where they are."""
+    return crumbs(PATH_ROOT, *parts)
+
+
+async def show(cq, bot, text, kbc=None):
+    """One screen lives in one message: rewrite it in place."""
+    await render(cq, bot, text, kbc)
+
+
+async def loading(cq, bot, title, where=None):
+    """Instant feedback before a slow step, so the screen never looks frozen."""
+    await render(cq, bot, screen(f"⏳ {title}…", ["Секунду."], path=where), None)
+
+
+def ttl_meta(cfg):
+    minutes = max(1, int(float(getattr(cfg, "pending_ttl_seconds", 900) or 900) // 60))
+    return f"подтверждение действует {minutes} мин"
+
+
+def start_text(user):
+    """First screen: what this bot is, and the two things you can send it."""
+    name = str(getattr(user, "first_name", "") or "").strip()
+    hello = f"Привет, {esc(name)}!" if name else "Привет!"
+    return screen(
+        "🖨 Пульт принтера",
+        [
+            f"{hello} Отсюда управляют печатью, нагревом и анимациями на экране.",
+            "Пришлите файл .gcode — предложу напечатать.",
+            "Пришлите GIF или фото — соберу анимацию для дисплея.",
+        ],
+        path=path(),
+        meta=f"версия {__version__} · /help — справка",
+    )
+
+
+def menu_screen():
+    return screen(
+        "🖨 Пульт принтера",
+        ["Выберите раздел кнопкой ниже.", "Красная кнопка внизу — аварийный стоп."],
+        path=path(),
+    )
+
+
+def help_screen(topic="top"):
+    title, body = HELP_TOPICS.get(topic, HELP_TOPICS["top"])
+    return screen(title, body, path=path("помощь", "" if topic == "top" else topic))
+
+
+def whoami_text(user, chat):
+    return screen(
+        "🪪 Ваш доступ",
+        [
+            field("👤", "Имя", getattr(user, "first_name", "—")),
+            f"🆔 Ваш ID: {code(getattr(user, 'id', '—'))}",
+            f"💬 Чат: {code(chat)}",
+            "",
+            "Этот ID должен быть в allowed_user_ids в config.yaml.",
+        ],
+        path=path("доступ"),
+    )
+
+
+def unknown_text(raw):
+    """Never stay silent: silence looks like a broken bot."""
+    first = [f"Не понял: {code(str(raw)[:80])}"] if raw else ["Пустое сообщение."]
+    return screen(
+        "🤔 Такой команды нет",
+        first + ["", "Я работаю кнопками. Откройте меню ниже или наберите /help."],
+        path=path(),
+    )
+
+
+def files_screen(p, pages, total):
+    if not total:
+        return screen(
+            "📂 Файлов нет",
+            ["В Moonraker нет ни одного .gcode.", "Пришлите файл в этот чат — я загружу его сам."],
+            path=path("файлы"),
+        )
+    return screen(
+        "📂 Файлы для печати",
+        ["Выберите файл. Перед запуском спрошу подтверждение."],
+        path=path("файлы"),
+        meta=f"файлов: {total} · страница {p + 1} из {pages}",
+    )
+
+
+def macros_screen(p, pages, total):
+    if not total:
+        return screen(
+            "🧩 Макросов нет",
+            ["Klipper не вернул ни одного макроса.", "Проверьте printer.cfg и состояние Klipper в /diag."],
+            path=path("макросы"),
+        )
+    return screen(
+        "🧩 Макросы Klipper",
+        ["Опасные макросы спрошу подтвердить."],
+        path=path("макросы"),
+        meta=f"макросов: {total} · страница {p + 1} из {pages}",
+    )
+
+
+def anims_screen(idx):
+    items = idx.get("items") or []
+    if not items:
+        return screen(
+            "🎬 Анимаций нет",
+            ["Пришлите GIF, фото или короткое видео.", "Я покажу превью и соберу анимацию для экрана."],
+            path=path("анимации"),
+        )
+    return screen(
+        "🎬 Анимации на экране",
+        ["▶ показать · ⭐ включать при старте", "✏️ переименовать · 🗑 удалить"],
+        path=path("анимации"),
+        meta=f"анимаций: {len(items)}",
+    )
+
+
+def temp_screen():
+    return screen(
+        "🌡 Температуры",
+        ["Выберите пресет. Ноль выключает нагрев.", "В кнопках сверху: текущая / целевая."],
+        path=path("температура"),
+    )
+
+
+def move_screen(move):
+    return screen(
+        "🕹 Движение",
+        [
+            "Шаг меняется кнопками «Шаг XY» и «Шаг Z».",
+            "После включения принтера сначала нужен Home.",
+        ],
+        path=path("движение"),
+        meta=f"шаг XY {move['xy']:g} мм · шаг Z {move['z']:g} мм",
+    )
+
+
+def tune_screen():
+    return screen(
+        "⚙️ Тюнинг на ходу",
+        ["Скорость и поток меняются шагом 10%.", "Z-offset — шаг 0.05 мм, работает и во время печати."],
+        path=path("тюнинг"),
+    )
+
+
+def power_screen():
+    return screen(
+        "⚡ Питание и перезапуск",
+        ["Действия затрагивают весь принтер.", "Перед выполнением спрошу подтверждение."],
+        path=path("питание"),
+    )
+
+
+def recover_screen():
+    return screen(
+        "🔄 Восстановление Klipper",
+        [
+            "Klipper в состоянии shutdown или error.",
+            "",
+            "Restart — перезапуск службы, подходит в большинстве случаев.",
+            "Firmware restart — если плата сообщает об ошибке MCU.",
+            "",
+            "Причину смотрите в /errors.",
+        ],
+        path=path("восстановление"),
+    )
+
+
+def file_confirm_screen(cfg, filename, where="файлы"):
+    return screen(
+        "▶ Запустить печать?",
+        [
+            field("📄", "Файл", filename),
+            "",
+            "Принтер начнёт печать сразу после подтверждения.",
+            "Проверьте: стол чистый, сопло свободно, пруток загружен.",
+        ],
+        path=path(where, "запуск"),
+        meta=ttl_meta(cfg),
+    )
+
+
+def power_confirm_screen(cfg, action):
+    return screen(
+        f"⚠️ {POWER_NAMES.get(action, action)}?",
+        [
+            POWER_IMPACT.get(action, "Действие затронет весь принтер."),
+            "",
+            "Если идёт печать, действие будет отклонено.",
+        ],
+        path=path("питание", "подтверждение"),
+        meta=ttl_meta(cfg),
+    )
+
+
+def macro_confirm_screen(cfg, name):
+    return screen(
+        "⚠️ Опасный макрос",
+        [
+            field("🧩", "Макрос", name),
+            "",
+            "Макрос может двигать оси или менять конфигурацию.",
+            "Запускайте только если знаете, что он делает.",
+        ],
+        path=path("макросы", "подтверждение"),
+        meta=ttl_meta(cfg),
+    )
+
+
+def anim_delete_screen(cfg, name):
+    return screen(
+        "🗑 Удалить анимацию?",
+        [
+            field("🎬", "Анимация", name),
+            "",
+            "Файл анимации будет удалён, Klipper перезапустится.",
+            "Если что-то пойдёт не так, я верну всё обратно сам.",
+        ],
+        path=path("анимации", "удаление"),
+        meta=ttl_meta(cfg),
+    )
+
+
+def error_screen(title, lines, retry=None, where=None):
+    """Errors say what happened, what to do next, and give a way back."""
+    rows = []
+    if retry:
+        rows.append([("🔄 Повторить", retry)])
+    rows.append([("🩺 Диагностика", "m:diag")])
+    rows.append(nav_row(back=HOME))
+    return screen(title, lines, path=where or path()), kb(rows)
+
+STATE_TITLES = {
+    "printing": "🖨 Печать идёт",
+    "paused": "⏸ Печать на паузе",
+    "complete": "✅ Печать завершена",
+    "cancelled": "⛔ Печать отменена",
+    "error": "🚨 Ошибка печати",
+}
+
 
 async def status_text(pc):
     st = await pc.status()
     info = await pc.info()
     if not st and not info:
-        return "❌ Нет связи с Moonraker/Klipper."
+        return screen(
+            "❌ Нет связи",
+            [
+                "Moonraker или Klipper не ответили.",
+                "",
+                "Проверьте питание платы и службу moonraker.",
+                "Подробности: /diag",
+            ],
+            path=path("статус"),
+        )
 
     ps = st.get("print_stats", {})
     ds = st.get("display_status", {})
     ex, bed = st.get("extruder", {}), st.get("heater_bed", {})
-    klippy_state = info.get("state", "offline")
-    klippy_msg = info.get("state_message") or info.get("message")
-    lines = [
-        f"📊 Печать: {ps.get('state', 'standby')}",
-        f"🧠 Klipper: {klippy_state}",
-        f"📄 Файл: {ps.get('filename') or '—'}",
+    klippy_state = info.get("state", "offline") if info else "offline"
+    klippy_msg = (info.get("state_message") or info.get("message")) if info else None
+    state = ps.get("state", "standby")
+
+    body = [
+        field("🧠", "Klipper", klippy_state),
+        field("📄", "Файл", ps.get("filename") or "—"),
     ]
     if klippy_msg:
-        lines.append(f"❗ {klippy_msg}")
-    if ps.get("state") in ("printing", "paused"):
-        lines += [
-            f"⏳ Прогресс: {(ds.get('progress') or 0)*100:.1f}%",
-            f"⏱ Прошло: {fmt_dur(ps.get('total_duration'))}",
-        ]
-    lines += [
-        f"🌡 Хотенд: {ex.get('temperature',0):.1f} / {ex.get('target',0):.0f}",
-        f"🌡 Стол: {bed.get('temperature',0):.1f} / {bed.get('target',0):.0f}",
+        body.append(f"❗ {esc(klippy_msg)}")
+    if state in ("printing", "paused"):
+        frac = float(ds.get("progress") or 0)
+        done = float(ps.get("total_duration") or 0)
+        left = eta_seconds(done, frac)
+        body += ["", f"{progress(frac)} {pct(frac)}", field("⏱", "Прошло", fmt_dur(done))]
+        if left:
+            body.append(field("🏁", "Осталось", "~" + fmt_dur(left)))
+    body += [
+        "",
+        field("🌡", "Хотенд", f"{ex.get('temperature', 0):.1f} / {ex.get('target', 0):.0f} °C"),
+        field("🛏", "Стол", f"{bed.get('temperature', 0):.1f} / {bed.get('target', 0):.0f} °C"),
     ]
-    return "\n".join(lines)
+    return screen(
+        STATE_TITLES.get(state, "📊 Принтер свободен"),
+        body,
+        path=path("статус"),
+        meta=time.strftime("обновлено %H:%M:%S"),
+    )
 
 async def diag_text(pc, ws, cfg):
     du = shutil.disk_usage("/")
@@ -171,34 +517,77 @@ async def diag_text(pc, ws, cfg):
     last_text = "—"
     if last:
         last_text = f"#{last[0][0]} {last[0][5]}"
-    return (
-        f"🔎 Диагностика\nверсия бота: {__version__}\n"
-        f"аптайм: {fmt_dur(time.time()-DIAG['started'])}\n"
-        f"WS: {wst}\nWS reconnects: {getattr(ws,'reconnects',0)}\n"
-        f"Moonraker: {cfg.moonraker}\nKlipper: {info.get('state','offline') if info else 'offline'}\n"
-        f"диск свободно: {du.free//1024//1024} МБ\nпоследняя ошибка: {last_text}"
+    body = [
+        field("🏷", "Версия бота", __version__),
+        field("⏱", "Аптайм", fmt_dur(time.time() - DIAG["started"])),
+        field("🔌", "WebSocket", wst),
+        field("♻️", "Переподключений", getattr(ws, "reconnects", 0)),
+        field("🌐", "Moonraker", cfg.moonraker),
+        field("🧠", "Klipper", info.get("state", "offline") if info else "offline"),
+        field("💾", "Свободно на диске", f"{du.free // 1024 // 1024} МБ"),
+        field("🚨", "Последняя ошибка", last_text),
+    ]
+    return screen(
+        "🩺 Диагностика",
+        body,
+        path=path("диагностика"),
+        meta=time.strftime("проверено %H:%M:%S"),
     )
 
 async def errors_text(cfg):
     rows = await asyncio.to_thread(errorlog.recent, cfg, 10)
-    if not rows: return "🟢 Журнал ошибок пуст."
-    out = ["🚨 Последние ошибки:"]
-    for eid, ts, source, state, filename, message, details, ack in rows:
-        out.append(
-            f"#{eid} {ts} · {source}\n"
-            f"{str(message)[:160]}\n"
-            f"📄 {filename or '—'}"
+    if not rows:
+        return screen(
+            "🟢 Ошибок нет",
+            ["Журнал пуст. Это хороший знак.", "", "Ошибки печати и связи попадают сюда сами."],
+            path=path("ошибки"),
         )
-    return "\n\n".join(out)
+    body = []
+    for eid, ts, source, state, filename, message, details, ack_flag in rows:
+        body.append(f"<b>#{eid}</b> · {esc(ts)} · {esc(source)}")
+        body.append(esc(str(message)[:160]))
+        body.append(field("📄", "Файл", filename or "—"))
+        body.append("")
+    body.append("Подробности одной записи: <code>/error 12</code>")
+    return screen("🚨 Последние ошибки", body, path=path("ошибки"))
 
 async def history_text(pc):
     jobs = await pc.history(10)
-    if not jobs: return "Истории пока нет."
-    out = ["📜 Последние печати:"]
+    if not jobs:
+        return screen(
+            "📜 История пуста",
+            ["Здесь появятся последние печати.", "", "Начните с кнопки «🖨 Печать файла»."],
+            path=path("история"),
+        )
+    body = []
     for j in jobs:
-        em = {"completed":"✅","cancelled":"⛔","error":"🚨"}.get(j.get("status"),"❔")
-        out.append(f"{em} {j.get('filename','?')[:28]} · {fmt_dur(j.get('total_duration'))}")
-    return "\n".join(out)
+        em = {"completed": "✅", "cancelled": "⛔", "error": "🚨"}.get(j.get("status"), "❔")
+        body.append(f"{em} {esc(str(j.get('filename', '?'))[:40])} · {fmt_dur(j.get('total_duration'))}")
+    return screen(
+        "📜 Последние печати",
+        body,
+        path=path("история"),
+        meta=f"записей: {len(jobs)}",
+    )
+
+# One command name can be typed several ways. Buttons stay the main path.
+COMMAND_ALIASES = {
+    "/start": "start", "start": "start",
+    "/menu": "menu", "menu": "menu", "меню": "menu",
+    "/status": "status", "статус": "status",
+    "/files": "files", "файлы": "files",
+    "/anims": "anims", "анимации": "anims",
+    "/macros": "macros", "макросы": "macros",
+    "/temp": "temp", "температура": "temp",
+    "/history": "history", "история": "history",
+    "/diag": "diag",
+    "/errors": "errors",
+    "/error": "error",
+    "/stop": "stop", "стоп": "stop",
+    "/whoami": "whoami", "/id": "whoami",
+    "/help": "help", "help": "help", "помощь": "help",
+}
+
 
 @router.message(F.text)
 async def on_text(msg: Message, bot, pc, cfg, ws):
@@ -212,44 +601,74 @@ async def on_text(msg: Message, bot, pc, cfg, ws):
         if it:
             it["name"] = msg.text.strip()[:40] or "Анимация"
             anims.save_index(cfg, idx)
-            await msg.answer(f"Переименовано в «{it['name']}».", reply_markup=anim_kb(idx))
+            await msg.answer(
+                screen("✏️ Имя обновлено", [field("🎬", "Новое имя", it["name"])], path=path("анимации")),
+                reply_markup=anim_kb(idx),
+                parse_mode="HTML",
+            )
         return
 
-    t = msg.text.strip().lower()
-    if t in ("/menu","меню","menu","/start","start"):
-        await msg.answer("🖨 Пульт принтера:", reply_markup=await main_kb(pc))
-    elif t in ("/status","статус"):
-        await msg.answer(await status_text(pc), reply_markup=await main_kb(pc))
-    elif t in ("/history","история"):
-        await msg.answer(await history_text(pc), reply_markup=await main_kb(pc))
-    elif t == "/diag":
-        await msg.answer(await diag_text(pc, ws, cfg))
-    elif t == "/errors":
-        await send_long(msg.answer, await errors_text(cfg))
-    elif t.startswith("/error"):
-        parts = t.split()
+    raw = (msg.text or "").strip()
+    first = raw.split()[0].split("@")[0].lower() if raw else ""
+    cmd = COMMAND_ALIASES.get(first, "")
+
+    if cmd == "start":
+        await msg.answer(start_text(msg.from_user), reply_markup=await main_kb(pc), parse_mode="HTML")
+    elif cmd == "menu":
+        await msg.answer(menu_screen(), reply_markup=await main_kb(pc), parse_mode="HTML")
+    elif cmd == "status":
+        await msg.answer(await status_text(pc), reply_markup=await status_kb(pc), parse_mode="HTML")
+    elif cmd == "files":
+        kbc, p, pages, total = await files_kb(pc, 0)
+        await msg.answer(files_screen(p, pages, total), reply_markup=kbc, parse_mode="HTML")
+    elif cmd == "anims":
+        idx = anims.load_index(cfg)
+        await msg.answer(anims_screen(idx), reply_markup=anim_kb(idx), parse_mode="HTML")
+    elif cmd == "macros":
+        kbc, p, pages, total = await macro_kb(pc, 0)
+        await msg.answer(macros_screen(p, pages, total), reply_markup=kbc, parse_mode="HTML")
+    elif cmd == "temp":
+        await msg.answer(temp_screen(), reply_markup=await temp_kb(pc), parse_mode="HTML")
+    elif cmd == "history":
+        await msg.answer(await history_text(pc), reply_markup=history_kb(), parse_mode="HTML")
+    elif cmd == "diag":
+        await msg.answer(await diag_text(pc, ws, cfg), reply_markup=diag_kb(), parse_mode="HTML")
+    elif cmd == "errors":
+        await send_long(msg.answer, await errors_text(cfg), parse_mode="HTML")
+    elif cmd == "error":
+        parts = raw.split()
         if len(parts) != 2 or not parts[1].isdigit():
-            await msg.answer("Использование: /error <id>")
+            await msg.answer(
+                screen("🚨 Просмотр ошибки", ["Формат: <code>/error 12</code>", "", "Список последних: /errors"], path=path("ошибки")),
+                reply_markup=errors_kb(),
+                parse_mode="HTML",
+            )
         else:
             row = await asyncio.to_thread(errorlog.get, cfg, int(parts[1]))
             if not row:
-                await msg.answer("Ошибка не найдена.")
+                await msg.answer(
+                    screen("🚨 Запись не найдена", [f"Ошибки #{esc(parts[1])} нет в журнале.", "", "Список последних: /errors"], path=path("ошибки")),
+                    reply_markup=errors_kb(),
+                    parse_mode="HTML",
+                )
             else:
-                eid,ts,source,state,filename,message,details,ack = row
+                eid, ts, source, state, filename, message, details, ack_flag = row
+                # Plain text on purpose: a Klipper log would break HTML markup.
                 await send_long(
                     msg.answer,
                     f"🚨 Ошибка #{eid}\n🕒 {ts}\nИсточник: {source}\n"
                     f"Состояние: {state or '—'}\n📄 {filename or '—'}\n"
                     f"❌ {message}\n\nЛог:\n{(details or '—')[-6000:]}"
                 )
-    elif t in ("/stop","стоп"):
+    elif cmd == "stop":
         r = await pc.gcode("ANIMS_STOP_ALL")
-        await msg.answer("Анимация остановлена." if r.ok else f"❌ Не удалось остановить: {r.error}")
-    elif t == "/help":
-        await msg.answer(
-            "/menu · /status · /history · /diag · /errors · /error <id>\n"
-            "GIF/фото — анимация · .gcode — загрузка"
-        )
+        await msg.answer("⏹ Анимация остановлена." if r.ok else f"❌ Не удалось остановить: {r.error}")
+    elif cmd == "whoami":
+        await msg.answer(whoami_text(msg.from_user, chat), parse_mode="HTML")
+    elif cmd == "help":
+        await msg.answer(help_screen("top"), reply_markup=help_kb(), parse_mode="HTML")
+    else:
+        await msg.answer(unknown_text(raw), reply_markup=await main_kb(pc), parse_mode="HTML")
 
 @router.message(F.animation | F.photo | F.video | F.document)
 async def on_media(msg: Message, bot, pc, cfg):
@@ -260,17 +679,29 @@ async def on_media(msg: Message, bot, pc, cfg):
             await handle_gcode_upload(bot, msg, pc, cfg)
             return
         if msg.document.mime_type != "image/gif" and not fn.endswith(".gif"):
+            await msg.answer(
+                screen(
+                    "🤔 Не тот формат",
+                    [
+                        "Я принимаю .gcode для печати и GIF, фото или видео для анимации.",
+                        "",
+                        f"Пришли: {code(fn or '—')}",
+                    ],
+                    path=path(),
+                ),
+                parse_mode="HTML",
+            )
             return
     await anims.start_session(bot, cfg, msg, msg.chat.id, SESSIONS)
 
 async def handle_gcode_upload(bot, msg, pc, cfg):
     raw_name = msg.document.file_name or "upload.gcode"
     safe_name = os.path.basename(raw_name)
-    path = f"/tmp/up_{msg.chat.id}_{os.getpid()}_{safe_name}"
+    tmp_path = f"/tmp/up_{msg.chat.id}_{os.getpid()}_{safe_name}"
     try:
         f = await bot.get_file(msg.document.file_id)
-        await bot.download_file(f.file_path, path)
-        r = await pc.upload_gcode(path, safe_name)
+        await bot.download_file(f.file_path, tmp_path)
+        r = await pc.upload_gcode(tmp_path, safe_name)
         if not r.ok:
             eid = await errorlog.register_async(cfg, "moonraker", r.error or "upload failed", str(r.raw or ""), filename=safe_name)
             await bot.send_message(msg.chat.id, f"❌ Ошибка загрузки #{eid}: {r.error}")
@@ -281,14 +712,25 @@ async def handle_gcode_upload(bot, msg, pc, cfg):
         set_pending(msg.chat.id, {"kind":"gcode", "filename":safe_name})
         await bot.send_message(
             msg.chat.id,
-            f"📦 Загружено: {safe_name} · {sz}",
-            reply_markup=kb([[("▶ Напечатать","g:start"),("⬅️ Меню","m:main")]])
+            screen(
+                "📦 Файл загружен",
+                [
+                    field("📄", "Файл", safe_name),
+                    field("💾", "Размер", sz or "—"),
+                    "",
+                    "Запустить печать сейчас?",
+                ],
+                path=path("файлы", "загрузка"),
+                meta=ttl_meta(cfg),
+            ),
+            reply_markup=confirm_kb("g:start", "✅ Печатать", HOME),
+            parse_mode="HTML",
         )
     except Exception as e:
         eid = await errorlog.register_async(cfg, "upload", str(e), repr(e), filename=safe_name)
         await bot.send_message(msg.chat.id, f"❌ Ошибка загрузки #{eid}: {e}")
     finally:
-        clear_temp_file(path)
+        clear_temp_file(tmp_path)
 
 async def jog(pc, axis, sign, move):
     d = move["z"] * sign if axis == "z" else move["xy"] * sign
@@ -308,7 +750,7 @@ async def on_cb(cq: CallbackQuery, bot, pc, cfg, ws):
         await cq.answer()
         return
     if cq.message is None:
-        await cq.answer("Сообщение устарело")
+        await ack(cq, "Экран устарел. Наберите /menu", alert=True)
         return
 
     chat, data = cq.message.chat.id, cq.data or ""
@@ -368,19 +810,46 @@ async def on_cb(cq: CallbackQuery, bot, pc, cfg, ws):
         idx["default"] = None if idx.get("default") == p else p
         anims.save_index(cfg, idx)
         anims.regen_autostart(cfg, idx)
-        await cq.answer("Анимация по умолчанию обновлена")
-        await show(cq, bot, "🎬 Анимации:", anim_kb(idx))
+        await ack(cq, "⭐ Автозапуск обновлён")
+        await show(cq, bot, anims_screen(idx), anim_kb(idx))
         return
 
     if data.startswith("ren:"):
         RENAMING[chat] = {"prefix": data.split(":",1)[1], "ts": time.time()}
-        await cq.answer()
-        await bot.send_message(chat, "Пришлите новое имя анимации.")
+        await ack(cq, "Жду новое имя")
+        await bot.send_message(
+            chat,
+            screen(
+                "✏️ Новое имя анимации",
+                ["Пришлите имя одним сообщением.", "Не длиннее 40 символов."],
+                path=path("анимации", "переименование"),
+            ),
+            parse_mode="HTML",
+        )
         return
 
     if data.startswith("del:"):
         p = data.split(":",1)[1]
-        await cq.answer()
+        it = next((x for x in idx["items"] if x["prefix"] == p), None)
+        if not it:
+            await ack(cq, "Анимация уже удалена", alert=True)
+            await show(cq, bot, anims_screen(idx), anim_kb(idx))
+            return
+        # Destructive step: ask on a screen, never inside a toast.
+        set_pending(chat, {"kind": "anim_del", "prefix": p})
+        await ack(cq)
+        await show(cq, bot, anim_delete_screen(cfg, it["name"]),
+                   confirm_kb(f"adel:{p}", "🗑 Удалить", "m:anims"))
+        return
+
+    if data.startswith("adel:"):
+        p = data.split(":",1)[1]
+        pend = take_pending(chat, "anim_del", getattr(cfg, "pending_ttl_seconds", 900))
+        if not pend or pend.get("prefix") != p:
+            await ack(cq, "Подтверждение устарело", alert=True)
+            await show(cq, bot, anims_screen(idx), anim_kb(idx))
+            return
+        await ack(cq, "Удаляю…")
         async with chat_lock(chat):
             ok, reason = await SAFETY.require_idle(pc)
             if not ok:
@@ -422,28 +891,56 @@ async def on_cb(cq: CallbackQuery, bot, pc, cfg, ws):
         return
 
     if data == "m:noop":
-        await cq.answer(); return
+        await ack(cq)
+        return
     if data == "m:main":
-        await cq.answer(); await show(cq, bot, "🖨 Пульт принтера:", await main_kb(pc)); return
+        await ack(cq)
+        await show(cq, bot, menu_screen(), await main_kb(pc))
+        return
     if data == "m:status":
-        await cq.answer(); await show(cq, bot, await status_text(pc), await main_kb(pc)); return
+        await ack(cq)
+        await show(cq, bot, await status_text(pc), await status_kb(pc))
+        return
     if data == "m:history":
-        await cq.answer(); await show(cq, bot, await history_text(pc), await main_kb(pc)); return
+        await ack(cq)
+        await loading(cq, bot, "Читаю историю", path("история"))
+        await show(cq, bot, await history_text(pc), history_kb())
+        return
     if data == "m:cam":
-        await cq.answer()
-        if not await ws.send_cam():
-            await bot.send_message(chat, "❌ Не удалось получить кадр камеры.")
+        await ack(cq, "Снимаю кадр…")
+        if not await ws.send_cam(caption=time.strftime("📷 Камера · %H:%M:%S")):
+            await bot.send_message(
+                chat,
+                screen(
+                    "📷 Кадр не получен",
+                    ["Камера не ответила.", "", "Проверьте camera_url в конфиге и службу камеры."],
+                    path=path("камера"),
+                ),
+                parse_mode="HTML",
+            )
+        return
+    if data.startswith("h:"):
+        await ack(cq)
+        await show(cq, bot, help_screen(data[2:] or "top"), help_kb())
+        return
+    if data == "m:diag":
+        await ack(cq)
+        await show(cq, bot, await diag_text(pc, ws, cfg), diag_kb())
+        return
+    if data == "m:errors":
+        await ack(cq)
+        await show(cq, bot, await errors_text(cfg), errors_kb())
         return
     if data == "m:anims":
-        await cq.answer()
-        if idx["items"]: await show(cq, bot, "🎬 Анимации:", anim_kb(idx))
-        else: await show(cq, bot, "Анимаций нет. Пришлите GIF/фото.", await main_kb(pc))
+        await ack(cq)
+        await show(cq, bot, anims_screen(idx), anim_kb(idx))
         return
     if data == "m:macros" or data.startswith("m:macros:"):
-        await cq.answer()
+        await ack(cq)
         p = int(data.split(":")[2]) if data.startswith("m:macros:") else 0
-        kbc, p, pages = await macro_kb(pc, p)
-        await show(cq, bot, f"🧩 Макросы (стр. {p+1}/{pages}):", kbc)
+        await loading(cq, bot, "Читаю макросы", path("макросы"))
+        kbc, p, pages, total = await macro_kb(pc, p)
+        await show(cq, bot, macros_screen(p, pages, total), kbc)
         return
 
     if data.startswith("mc:run:"):
@@ -454,111 +951,208 @@ async def on_cb(cq: CallbackQuery, bot, pc, cfg, ws):
             await cq.answer("Некорректная команда"); return
         pending = take_pending(chat, "macro", getattr(cfg, "pending_ttl_seconds", 900))
         if not pending:
-            await cq.answer("Подтверждение устарело"); return
+            await ack(cq, "Подтверждение устарело. Откройте макросы заново", alert=True)
+            kbc, page, pages, total = await macro_kb(pc, 0)
+            await show(cq, bot, macros_screen(page, pages, total), kbc)
+            return
         if int(pending.get("index", -1)) != i or pending.get("digest") != digest:
-            await cq.answer("Подтверждение не совпадает — откройте меню заново"); return
+            await ack(cq, "Подтверждение не совпадает. Откройте макросы заново", alert=True); return
         macros = await pc.macros()
         if i >= len(macros) or macro_digest(macros[i]) != digest:
-            await cq.answer("Макрос изменился — откройте меню заново"); return
+            await ack(cq, "Макрос изменился. Откройте макросы заново", alert=True); return
+        await ack(cq, "Выполняю…")
         async with chat_lock(chat):
             ok, reason = await SAFETY.require_idle(pc)
             if not ok:
-                await cq.answer("Операция запрещена")
-                await bot.send_message(chat, f"❌ Макрос запрещён: {reason}")
+                await show(
+                    cq, bot,
+                    screen("❌ Макрос запрещён", [field("🧩", "Макрос", macros[i]), "", esc(reason)], path=path("макросы")),
+                    kb([[("🧩 К макросам", "m:macros")], nav_row(back=HOME)]),
+                )
                 return
             r = await pc.gcode(macros[i])
-        eid = None if r.ok else await errorlog.register_async(cfg, "macro", r.error or "macro failed", str(r.raw or ""), filename=macros[i])
-        await cq.answer("Выполнено" if r.ok else f"Ошибка #{eid}")
-        await bot.send_message(chat, f"{'🧩 Выполнено' if r.ok else '⚠️ Ошибка'}: {macros[i]}"
-                               + (f"\n{r.error}" if not r.ok else ""))
+        if r.ok:
+            await show(
+                cq, bot,
+                screen("🧩 Макрос выполнен", [field("🧩", "Макрос", macros[i])], path=path("макросы"), meta=time.strftime("готово в %H:%M:%S")),
+                kb([[("🧩 К макросам", "m:macros")], nav_row(back=HOME)]),
+            )
+        else:
+            eid = await errorlog.register_async(cfg, "macro", r.error or "macro failed", str(r.raw or ""), filename=macros[i])
+            text, markup = error_screen(
+                "⚠️ Макрос не выполнен",
+                [field("🧩", "Макрос", macros[i]), field("🚨", "Ошибка", r.error or "неизвестно"), "", f"Запись #{eid}. Подробности: /error {eid}"],
+                retry="m:macros",
+                where=path("макросы"),
+            )
+            await show(cq, bot, text, markup)
         return
 
     if data.startswith("mc:"):
         i, digest = _macro_from_data(data)
         if i is None:
-            await cq.answer("Некорректный макрос"); return
+            await ack(cq, "Некорректный макрос", alert=True); return
         macros = await pc.macros()
         if i >= len(macros) or macro_digest(macros[i]) != digest:
-            await cq.answer("Макрос изменился — откройте меню заново"); return
-        await cq.answer()
+            await ack(cq, "Список макросов изменился. Обновляю", alert=True)
+            kbc, page, pages, total = await macro_kb(pc, 0)
+            await show(cq, bot, macros_screen(page, pages, total), kbc)
+            return
         name = macros[i]
         if cfg.dangerous_macros_require_confirmation and macro_is_dangerous(name):
             set_pending(chat, {"kind":"macro","index":i,"digest":digest,"name":name})
-            await show(cq, bot, f"⚠️ Потенциально опасный макрос: {name}",
-                       kb([[("✅ Выполнить",f"mc:run:{i}:{digest}"),("❌ Отмена","m:macros")]]))
+            await ack(cq)
+            await show(cq, bot, macro_confirm_screen(cfg, name),
+                       confirm_kb(f"mc:run:{i}:{digest}", "✅ Выполнить", "m:macros"))
             return
+        await ack(cq, "Выполняю…")
         ok, reason = await SAFETY.require_idle(pc)
         if not ok:
-            await bot.send_message(chat, f"❌ Макрос запрещён: {reason}")
+            await show(
+                cq, bot,
+                screen("❌ Макрос запрещён", [field("🧩", "Макрос", name), "", esc(reason)], path=path("макросы")),
+                kb([[("🧩 К макросам", "m:macros")], nav_row(back=HOME)]),
+            )
             return
         r = await pc.gcode(name)
-        eid = None if r.ok else await errorlog.register_async(cfg, "macro", r.error or "macro failed", str(r.raw or ""), filename=name)
-        await bot.send_message(chat, f"{'🧩 Выполнено' if r.ok else '⚠️ Ошибка'}: {name}"
-                               + (f"\n{r.error} · #{eid}" if not r.ok else ""))
+        if r.ok:
+            await show(
+                cq, bot,
+                screen("🧩 Макрос выполнен", [field("🧩", "Макрос", name)], path=path("макросы"), meta=time.strftime("готово в %H:%M:%S")),
+                kb([[("🧩 К макросам", "m:macros")], nav_row(back=HOME)]),
+            )
+        else:
+            eid = await errorlog.register_async(cfg, "macro", r.error or "macro failed", str(r.raw or ""), filename=name)
+            text, markup = error_screen(
+                "⚠️ Макрос не выполнен",
+                [field("🧩", "Макрос", name), field("🚨", "Ошибка", r.error or "неизвестно"), "", f"Запись #{eid}. Подробности: /error {eid}"],
+                retry="m:macros",
+                where=path("макросы"),
+            )
+            await show(cq, bot, text, markup)
         return
 
     if data.startswith("m:files:"):
-        await cq.answer()
+        await ack(cq)
         try:
-            kbc, p, pages = await files_kb(pc, int(data.split(":")[2]))
-            await show(cq, bot, f"📂 Файлы (стр. {p+1}/{pages}):", kbc)
+            await loading(cq, bot, "Читаю список файлов", path("файлы"))
+            kbc, p, pages, total = await files_kb(pc, int(data.split(":")[2]))
+            await show(cq, bot, files_screen(p, pages, total), kbc)
         except Exception as e:
             eid = await errorlog.register_async(cfg, "ui", str(e), repr(e))
-            await bot.send_message(chat, f"❌ Ошибка списка файлов #{eid}")
+            text, markup = error_screen(
+                "❌ Список не открылся",
+                [f"Ошибка #{eid}: Moonraker не ответил.", "", "Попробуйте ещё раз или откройте диагностику."],
+                retry="m:files:0",
+                where=path("файлы"),
+            )
+            await show(cq, bot, text, markup)
         return
 
     if data.startswith("f:conf:"):
         k = int(data.split(":")[2])
         items = file_items(await pc.files())
         if k >= len(items):
-            await cq.answer("Список устарел"); return
+            await ack(cq, "Список устарел. Обновляю", alert=True)
+            kbc, p, pages, total = await files_kb(pc, 0)
+            await show(cq, bot, files_screen(p, pages, total), kbc)
+            return
         filename = items[k][1]
         set_pending(chat, {"kind":"file","filename":filename})
-        await cq.answer()
-        await show(cq, bot, f"Запустить «{filename}»?",
-                   kb([[("✅ Старт","f:start"),("⬅️ Назад","m:files:0")]]))
+        await ack(cq)
+        await show(cq, bot, file_confirm_screen(cfg, filename),
+                   confirm_kb("f:start", "✅ Печатать", "m:files:0"))
         return
 
     if data == "f:start" or data == "g:start":
         expected = "file" if data == "f:start" else "gcode"
         p = take_pending(chat, expected, getattr(cfg, "pending_ttl_seconds", 900))
         if not p:
-            await cq.answer("Список устарел"); return
+            await ack(cq, "Подтверждение устарело. Выберите файл заново", alert=True)
+            kbc, page, pages, total = await files_kb(pc, 0)
+            await show(cq, bot, files_screen(page, pages, total), kbc)
+            return
+        await ack(cq, "Запускаю…")
+        await loading(cq, bot, "Запускаю печать", path("файлы", "запуск"))
         async with chat_lock(chat):
             ok, reason = await SAFETY.require_idle(pc)
             if not ok:
-                await cq.answer("Печать активна")
-                await bot.send_message(chat, f"❌ Запуск запрещён: {reason}")
+                await show(
+                    cq, bot,
+                    screen(
+                        "❌ Запуск отклонён",
+                        [field("📄", "Файл", p["filename"]), "", esc(reason), "", "Дождитесь конца печати или отмените её."],
+                        path=path("файлы", "запуск"),
+                    ),
+                    await main_kb(pc),
+                )
                 return
             r = await pc.print_start(p["filename"])
         if r.ok:
-            await cq.answer("Запускаю…")
-            await show(cq, bot, f"▶ Запускаю {p['filename']}…", await main_kb(pc))
+            await show(
+                cq, bot,
+                screen(
+                    "▶ Печать запущена",
+                    [field("📄", "Файл", p["filename"]), "", "Прогресс виден в разделе «Статус»."],
+                    path=path("файлы"),
+                    meta=time.strftime("запуск в %H:%M:%S"),
+                ),
+                await main_kb(pc),
+            )
         else:
             eid = await errorlog.register_async(cfg, "moonraker", r.error or "print start failed", str(r.raw or ""), filename=p["filename"])
-            await cq.answer(f"Ошибка #{eid}")
-            await show(cq, bot, f"❌ Не удалось запустить #{eid}: {r.error}", await main_kb(pc))
+            text, markup = error_screen(
+                "❌ Печать не началась",
+                [
+                    field("📄", "Файл", p["filename"]),
+                    field("🚨", "Ошибка", r.error or "неизвестно"),
+                    "",
+                    f"Запись #{eid}. Подробности: /error {eid}",
+                ],
+                retry="m:files:0",
+                where=path("файлы"),
+            )
+            await show(cq, bot, text, markup)
         return
 
     if data == "m:pause":
+        await ack(cq, "Ставлю на паузу…")
         async with chat_lock(chat):
             ok, reason = await SAFETY.require_printing(pc)
             r = await pc.pause() if ok else MRResult(False, error=reason)
-        await cq.answer("Пауза" if r.ok else f"Ошибка: {r.error}")
         if not r.ok:
             await errorlog.register_async(cfg, "moonraker", r.error or "pause failed", str(r.raw or ""))
+            text, markup = error_screen(
+                "⏸ Пауза не вышла",
+                [field("🚨", "Причина", r.error or "неизвестно")],
+                retry="m:pause",
+                where=path("статус"),
+            )
+            await show(cq, bot, text, markup)
+            return
+        await show(cq, bot, await status_text(pc), await status_kb(pc))
         return
 
     if data == "m:resume":
+        await ack(cq, "Продолжаю…")
         async with chat_lock(chat):
             ok, reason = await SAFETY.require_paused(pc)
             r = await pc.resume() if ok else MRResult(False, error=reason)
-        await cq.answer("Продолжаю" if r.ok else f"Ошибка: {r.error}")
         if not r.ok:
             await errorlog.register_async(cfg, "moonraker", r.error or "resume failed", str(r.raw or ""))
+            text, markup = error_screen(
+                "▶ Продолжение не вышло",
+                [field("🚨", "Причина", r.error or "неизвестно")],
+                retry="m:resume",
+                where=path("статус"),
+            )
+            await show(cq, bot, text, markup)
+            return
+        await show(cq, bot, await status_text(pc), await status_kb(pc))
         return
 
     if data == "m:cancel":
+        await ack(cq, "Отменяю печать…")
         async with chat_lock(chat):
             st = await pc.status()
             info = await pc.info()
@@ -573,79 +1167,122 @@ async def on_cb(cq: CallbackQuery, bot, pc, cfg, ws):
                 r = MRResult(False, error="нет активной печати")
 
         if r.ok:
-            await cq.answer("Отмена отправлена")
-            await bot.send_message(chat, "⏹ Команда отмены печати отправлена. Ожидаю подтверждение от Klipper…")
+            await show(
+                cq, bot,
+                screen(
+                    "⏹ Отмена отправлена",
+                    ["Жду подтверждение от Klipper.", "", "Состояние обновится автоматически."],
+                    path=path("статус"),
+                    meta=time.strftime("отправлено в %H:%M:%S"),
+                ),
+                await main_kb(pc),
+            )
         else:
             eid = await errorlog.register_async(cfg, "moonraker", r.error or "cancel failed", str(r.raw or ""))
-            await cq.answer(f"Ошибка #{eid}")
-            await bot.send_message(chat, f"❌ Отмена не выполнена #{eid}: {r.error}")
+            text, markup = error_screen(
+                "❌ Отмена не выполнена",
+                [field("🚨", "Причина", r.error or "неизвестно"), "", f"Запись #{eid}. Подробности: /error {eid}"],
+                retry="m:cancel",
+                where=path("статус"),
+            )
+            await show(cq, bot, text, markup)
         return
 
     if data == "m:temp":
-        await cq.answer(); await show(cq, bot, "🌡 Температуры:", await temp_kb(pc)); return
+        await ack(cq)
+        await show(cq, bot, temp_screen(), await temp_kb(pc))
+        return
+
+    if data == "t:off":
+        await ack(cq, "Выключаю нагрев…")
+        async with chat_lock(chat):
+            r1 = await pc.gcode("SET_HEATER_TEMPERATURE HEATER=extruder TARGET=0")
+            r2 = await pc.gcode("SET_HEATER_TEMPERATURE HEATER=heater_bed TARGET=0")
+        if not (r1.ok and r2.ok):
+            await errorlog.register_async(cfg, "gcode", r1.error or r2.error or "heaters off failed", str(r1.raw or r2.raw or ""))
+        await asyncio.sleep(0.2)
+        await show(cq, bot, temp_screen(), await temp_kb(pc))
+        return
 
     if data.startswith("t:hot:"):
         target = int(data.split(":")[2])
         r = await pc.gcode(f"SET_HEATER_TEMPERATURE HEATER=extruder TARGET={target}")
-        await cq.answer("ОК" if r.ok else f"Ошибка: {r.error}")
+        await ack(cq, f"Хотенд → {target} °C" if r.ok else f"Не вышло: {r.error}", alert=not r.ok)
         if not r.ok:
             await errorlog.register_async(cfg, "gcode", r.error or "heater failed", str(r.raw or ""))
         await asyncio.sleep(0.2)
-        await show(cq, bot, "🌡 Температуры:", await temp_kb(pc))
+        await show(cq, bot, temp_screen(), await temp_kb(pc))
         return
 
     if data.startswith("t:bed:"):
         target = int(data.split(":")[2])
         r = await pc.gcode(f"SET_HEATER_TEMPERATURE HEATER=heater_bed TARGET={target}")
-        await cq.answer("ОК" if r.ok else f"Ошибка: {r.error}")
+        await ack(cq, f"Стол → {target} °C" if r.ok else f"Не вышло: {r.error}", alert=not r.ok)
         if not r.ok:
             await errorlog.register_async(cfg, "gcode", r.error or "heater failed", str(r.raw or ""))
         await asyncio.sleep(0.2)
-        await show(cq, bot, "🌡 Температуры:", await temp_kb(pc))
+        await show(cq, bot, temp_screen(), await temp_kb(pc))
         return
 
     if data == "m:move":
-        await cq.answer(); await show(cq, bot, "🕹 Движение:", move_kb(move_state(cfg, chat))); return
+        await ack(cq)
+        mv = move_state(cfg, chat)
+        await show(cq, bot, move_screen(mv), move_kb(mv))
+        return
 
     if data == "v:xydist":
         mv = move_state(cfg, chat); mv["xy"] = cycle(cfg.xy_steps, mv["xy"])
-        await cq.answer(f"XY шаг: {mv['xy']:g} мм")
-        await show(cq, bot, "🕹 Движение:", move_kb(mv)); return
+        await ack(cq, f"Шаг XY → {mv['xy']:g} мм")
+        await show(cq, bot, move_screen(mv), move_kb(mv))
+        return
 
     if data == "v:zdist":
         mv = move_state(cfg, chat); mv["z"] = cycle(cfg.z_steps, mv["z"])
-        await cq.answer(f"Z шаг: {mv['z']:g} мм")
-        await show(cq, bot, "🕹 Движение:", move_kb(mv)); return
+        await ack(cq, f"Шаг Z → {mv['z']:g} мм")
+        await show(cq, bot, move_screen(mv), move_kb(mv))
+        return
 
     if data == "v:home":
+        await ack(cq, "Паркую оси…")
         async with chat_lock(chat):
             ok, reason = await SAFETY.require_motion(pc)
             r = await pc.gcode("G28") if ok else MRResult(False, error=reason)
-        await cq.answer("Home" if r.ok else f"Ошибка: {r.error}")
         if not r.ok:
             await errorlog.register_async(cfg, "motion", r.error or "home failed", str(r.raw or ""))
+            text, markup = error_screen(
+                "🏠 Парковка не вышла",
+                [field("🚨", "Причина", r.error or "неизвестно")],
+                retry="v:home",
+                where=path("движение"),
+            )
+            await show(cq, bot, text, markup)
+            return
+        mv = move_state(cfg, chat)
+        await show(cq, bot, move_screen(mv), move_kb(mv))
         return
 
     if data.startswith("v:"):
         a = data[2:]
         if len(a) < 2:
-            await cq.answer("Некорректное движение"); return
+            await ack(cq, "Некорректное движение", alert=True); return
         axis = a[0]
         sign = 1 if a[1] == "+" else -1
+        mv = move_state(cfg, chat)
+        step = mv["z"] if axis == "z" else mv["xy"]
         async with chat_lock(chat):
             ok, reason = await SAFETY.require_motion(pc)
-            r = await jog(pc, axis, sign, move_state(cfg, chat)) if ok else MRResult(False, error=reason)
-        await cq.answer(
-            f"{axis.upper()} {'+' if sign > 0 else '−'}"
-            f"{move_state(cfg,chat)['z'] if axis=='z' else move_state(cfg,chat)['xy']:g} мм"
-            if r.ok else f"Ошибка: {r.error}"
-        )
-        if not r.ok:
+            r = await jog(pc, axis, sign, mv) if ok else MRResult(False, error=reason)
+        if r.ok:
+            await ack(cq, f"{axis.upper()} {'+' if sign > 0 else '−'}{step:g} мм")
+        else:
+            await ack(cq, f"Не вышло: {r.error}", alert=True)
             await errorlog.register_async(cfg, "motion", r.error or "jog failed", str(r.raw or ""))
         return
 
     if data in ("m:tune","u:tune"):
-        await cq.answer(); await show(cq, bot, "⚙️ Тюнинг:", await tune_kb(pc)); return
+        await ack(cq)
+        await show(cq, bot, tune_screen(), await tune_kb(pc))
+        return
 
     if data in ("u:speed-","u:speed+","u:flow-","u:flow+"):
         st = await pc.status()
@@ -656,50 +1293,61 @@ async def on_cb(cq: CallbackQuery, bot, pc, cfg, ws):
         else:
             cur = max(10, min(200, round((th.get("extrude_factor") or 1)*100) + (10 if data.endswith("+") else -10)))
             r = await pc.gcode(f"M221 S{cur}")
-        await cq.answer("ОК" if r.ok else f"Ошибка: {r.error}")
+        label = "Скорость" if data.startswith("u:speed") else "Поток"
+        await ack(cq, f"{label} → {cur} %" if r.ok else f"Не вышло: {r.error}", alert=not r.ok)
         if not r.ok:
             await errorlog.register_async(cfg, "gcode", r.error or "tune failed", str(r.raw or ""))
-        await show(cq, bot, "⚙️ Тюнинг:", await tune_kb(pc))
+        await show(cq, bot, tune_screen(), await tune_kb(pc))
         return
 
     if data in ("u:fan:on","u:fan:off"):
-        r = await pc.gcode("M106 S255" if data.endswith("on") else "M106 S0")
-        await cq.answer("ОК" if r.ok else f"Ошибка: {r.error}")
+        on = data.endswith("on")
+        r = await pc.gcode("M106 S255" if on else "M106 S0")
+        await ack(
+            cq,
+            ("Вентилятор включён" if on else "Вентилятор выключен") if r.ok else f"Не вышло: {r.error}",
+            alert=not r.ok,
+        )
+        if not r.ok:
+            await errorlog.register_async(cfg, "gcode", r.error or "fan failed", str(r.raw or ""))
+        await show(cq, bot, tune_screen(), await tune_kb(pc))
         return
 
     if data in ("u:z+","u:z-"):
         adj = 0.05 if data == "u:z+" else -0.05
         r = await pc.gcode(f"SET_GCODE_OFFSET Z_ADJUST={adj} MOVE=1")
-        await cq.answer(f"Z {adj:+.2f}" if r.ok else f"Ошибка: {r.error}")
+        await ack(cq, f"Z-оффсет {adj:+.2f} мм" if r.ok else f"Не вышло: {r.error}", alert=not r.ok)
         if not r.ok:
             await errorlog.register_async(cfg, "gcode", r.error or "z offset failed", str(r.raw or ""))
-        await show(cq, bot, "⚙️ Тюнинг:", await tune_kb(pc))
+        await show(cq, bot, tune_screen(), await tune_kb(pc))
         return
 
     if data == "m:power":
-        await cq.answer(); await show(cq, bot, "⚡ Питание:", power_kb()); return
+        await ack(cq)
+        await show(cq, bot, power_screen(), power_kb())
+        return
 
     if data == "p:recover":
-        await cq.answer()
-        await show(cq, bot, "🔄 Восстановление Klipper",
-                   kb([[("🔄 Restart Klipper","p:conf:restart"),("🔁 Firmware restart","p:conf:fw")],
-                       [("⬅️ Меню","m:main")]]))
+        await ack(cq)
+        await show(cq, bot, recover_screen(),
+                   kb([[("🔄 Restart Klipper","p:conf:restart")],
+                       [("🔁 Firmware restart","p:conf:fw")],
+                       nav_row(back="m:power", home=True)]))
         return
 
     if data.startswith("p:conf:"):
         a = data.split(":")[2]
-        names = {"restart":"Restart Klipper","fw":"Firmware restart","reboot":"Reboot хоста","shutdown":"Shutdown хоста"}
-        if a not in names:
-            await cq.answer("Неизвестная операция"); return
+        if a not in POWER_NAMES:
+            await ack(cq, "Неизвестная операция", alert=True); return
 
         if not cfg.power_actions_require_confirmation:
-            await cq.answer()
+            await ack(cq, "Выполняю…")
             await _execute_power(cq, bot, pc, cfg, chat, a)
         else:
-            await cq.answer()
+            await ack(cq)
             set_pending(chat, {"kind": "power", "action": a})
-            await show(cq, bot, f"Точно: {names[a]}?",
-                       kb([[("✅ Да",f"p:do:{a}"),("⬅️ Назад","m:power")]]))
+            await show(cq, bot, power_confirm_screen(cfg, a),
+                       confirm_kb(f"p:do:{a}", "✅ Выполнить", "m:power"))
         return
 
     if data.startswith("p:do:"):
@@ -707,27 +1355,48 @@ async def on_cb(cq: CallbackQuery, bot, pc, cfg, ws):
         if cfg.power_actions_require_confirmation:
             p = take_pending(chat, "power", getattr(cfg, "pending_ttl_seconds", 900))
             if not p or p.get("action") != a:
-                await cq.answer("Подтверждение устарело"); return
-        await cq.answer()
+                await ack(cq, "Подтверждение устарело. Выберите операцию заново", alert=True)
+                await show(cq, bot, power_screen(), power_kb())
+                return
+        await ack(cq, "Выполняю…")
         await _execute_power(cq, bot, pc, cfg, chat, a)
         return
 
     if data == "m:estop":
+        # UX exception on purpose: no confirmation screen. Safety beats one extra tap.
         async with chat_lock(chat):
             r = await pc.emergency_stop()
         eid = None
         if not r.ok:
             eid = await errorlog.register_async(cfg, "moonraker", r.error or "emergency stop failed", str(r.raw or ""))
         log.critical("EMERGENCY STOP by %s ok=%s", cq.from_user.id, r.ok)
-        await cq.answer("АВАРИЙНЫЙ СТОП" if r.ok else f"Ошибка #{eid}")
-        await bot.send_message(
-            chat,
-            "🚨 Выполнен аварийный стоп. Klipper теперь можно восстановить через кнопку в меню."
-            if r.ok else f"🚨 Не удалось выполнить аварийный стоп #{eid}: {r.error}"
-        )
+        await ack(cq, "АВАРИЙНЫЙ СТОП" if r.ok else f"Не вышло. Запись #{eid}", alert=not r.ok)
+        if r.ok:
+            body = screen(
+                "🚨 Аварийный стоп выполнен",
+                [
+                    "Моторы и нагрев сброшены.",
+                    "",
+                    "Klipper восстановите кнопкой «Восстановление».",
+                ],
+                path=path("питание"),
+                meta=time.strftime("%H:%M:%S"),
+            )
+            await bot.send_message(chat, body, reply_markup=power_kb(), parse_mode="HTML")
+        else:
+            body = screen(
+                "🚨 Стоп не выполнен",
+                [
+                    field("🚨", "Ошибка", r.error or "неизвестно"),
+                    "",
+                    f"Запись #{eid}. Снимите питание принтера вручную.",
+                ],
+                path=path("питание"),
+            )
+            await bot.send_message(chat, body, parse_mode="HTML")
         return
 
-    await cq.answer()
+    await ack(cq)
 
 async def _execute_power(cq, bot, pc, cfg, chat, action):
     funcs = {
@@ -769,3 +1438,15 @@ async def on_error(event: ErrorEvent):
         log.warning("Telegram flood limit: retry after %s", exc.retry_after)
         return
     log.exception("handler error: %s", exc)
+
+    # Never leave a tap unanswered: say where to look.
+    update = getattr(event, "update", None)
+    cq = getattr(update, "callback_query", None)
+    msg = getattr(update, "message", None)
+    try:
+        if cq is not None:
+            await ack(cq, "Ошибка. Подробности в /errors", alert=True)
+        elif msg is not None:
+            await msg.answer("❌ Ошибка при обработке. Посмотрите /errors или /diag.")
+    except Exception:
+        log.debug("error notice failed", exc_info=True)
