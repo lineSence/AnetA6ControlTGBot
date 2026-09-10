@@ -9,6 +9,7 @@ fi
 cd "$ROOT"
 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" "$PY" - <<'PY_IMPORT_CHECK'
 import tgbot.config, tgbot.printer, tgbot.safety, tgbot.ws, tgbot.handlers, tgbot.anims, tgbot.main
+import tgbot.ui, tgbot.uxkit, tgbot.middlewares
 from tgbot.ws import MoonrakerWS, health_loop
 assert callable(health_loop)
 assert MoonrakerWS is not None
@@ -23,9 +24,15 @@ fi
 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" "$PY" - <<'PY_RUNTIME_IMPORT'
 from tgbot.ws import MoonrakerWS, health_loop
 from tgbot import main
+from tgbot.main import publish_ui
+from tgbot.middlewares import setup as setup_middlewares
+from tgbot.uxkit import BOT_COMMANDS
 assert callable(health_loop)
 assert MoonrakerWS is not None
 assert main.main is not None
+assert callable(publish_ui)
+assert callable(setup_middlewares)
+assert 0 < len(BOT_COMMANDS) <= 7
 print("runtime import check: OK")
 PY_RUNTIME_IMPORT
 PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" "$PY" -m pytest "$ROOT/tests" -q
