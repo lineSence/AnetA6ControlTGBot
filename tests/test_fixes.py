@@ -109,7 +109,8 @@ def test_start_session_rejects_unsupported_format(tmp_path):
 
 def test_migration_switches_to_venv_python():
     new = _migrate({"config_version": 5, "python": "python3"})
-    assert new["config_version"] == CURRENT_CONFIG_VERSION == 6
+    assert new["config_version"] == CURRENT_CONFIG_VERSION
+    assert CURRENT_CONFIG_VERSION >= 6
     assert new["python"] == "/opt/tgbot/bin/python"
     assert new["moonraker_api_key"] == ""
     assert new["upload_timeout"] == 300
