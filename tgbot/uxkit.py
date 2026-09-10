@@ -69,14 +69,14 @@ def screen(title, body=None, path=None, meta=None) -> str:
         out.append(f"<i>{esc(path)}</i>")
     if body:
         lines = [body] if isinstance(body, str) else [str(x) for x in body if x is not None]
-        text = "\\n".join(lines).strip("\\n")
+        text = "\n".join(lines).strip("\n")
         if text:
             out.append("")
             out.append(text)
     if meta:
         out.append("")
         out.append(f"<i>{esc(meta)}</i>")
-    return "\\n".join(out)
+    return "\n".join(out)
 
 
 def field(icon, label, value) -> str:

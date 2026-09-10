@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 import yaml
 
-CURRENT_CONFIG_VERSION = 6
+CURRENT_CONFIG_VERSION = 7
 
 DEFAULTS: dict[str, Any] = {
     "config_version": CURRENT_CONFIG_VERSION,
@@ -44,6 +44,9 @@ DEFAULTS: dict[str, Any] = {
     "critical_alerts_ignore_quiet_hours": True,
     "pending_ttl_seconds": 900,
     "session_ttl_seconds": 3600,
+    "antiflood_seconds": 0.8,
+    "deny_notice_seconds": 300,
+    "progress_bar_width": 12,
 }
 
 @dataclass(slots=True)
@@ -84,6 +87,9 @@ class Config:
     critical_alerts_ignore_quiet_hours: bool = True
     pending_ttl_seconds: int = 900
     session_ttl_seconds: int = 3600
+    antiflood_seconds: float = 0.8
+    deny_notice_seconds: int = 300
+    progress_bar_width: int = 12
 
 def as_bool(value: Any, default: bool = False) -> bool:
     if isinstance(value, bool):
@@ -140,6 +146,13 @@ def _migrate(data: dict[str, Any]) -> dict[str, Any]:
         data.setdefault("pending_ttl_seconds", 900)
         data.setdefault("session_ttl_seconds", 3600)
         version = 6
+
+    if version < 7:
+        # UX release 2.7.0: anti double tap, access notice window, bar width.
+        data.setdefault("antiflood_seconds", 0.8)
+        data.setdefault("deny_notice_seconds", 300)
+        data.setdefault("progress_bar_width", 12)
+        version = 7
 
     data["config_version"] = CURRENT_CONFIG_VERSION
     return data
@@ -208,6 +221,9 @@ def load(path: str | None = None) -> Config:
         critical_alerts_ignore_quiet_hours=as_bool(merged["critical_alerts_ignore_quiet_hours"], True),
         pending_ttl_seconds=max(60, int(merged["pending_ttl_seconds"])),
         session_ttl_seconds=max(300, int(merged["session_ttl_seconds"])),
+        antiflood_seconds=max(0.0, min(10.0, float(merged["antiflood_seconds"]))),
+        deny_notice_seconds=max(0, int(merged["deny_notice_seconds"])),
+        progress_bar_width=max(4, min(20, int(merged["progress_bar_width"]))),
     )
     if c.notify_chat is None and c.allowed_user_ids:
         c.notify_chat = sorted(c.allowed_user_ids)[0]
