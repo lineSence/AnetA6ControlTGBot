@@ -7,7 +7,7 @@ import tempfile
 # Unit-test the dependency-light modules without requiring aiogram.
 ROOT = Path("/root/tgbot/tgbot")
 
-from tgbot.config import _migrate, as_bool
+from tgbot.config import CURRENT_CONFIG_VERSION, _migrate, as_bool
 from tgbot.printer import file_items, fmt_size, fmt_dur, upload_ok, MRResult
 from tgbot.safety import Safety
 from tgbot.errorlog import extract_klippy_error
@@ -16,7 +16,7 @@ from tgbot.anims import num_to_prefix
 def test_config_migration():
     old = {"backup_dir": "/tmp/anims_backup"}
     new = _migrate(old)
-    assert new["config_version"] == 6
+    assert new["config_version"] == CURRENT_CONFIG_VERSION
     assert new["backup_dir"] == "/root/tgbot/backups/animations"
     assert new["python"] == "/opt/tgbot/bin/python"
     assert new["error_db"] == "/root/tgbot/errors.db"

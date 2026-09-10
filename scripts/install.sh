@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # AnetA6ControlTGBot: установщик из репозитория.
-# Версия 2.6.0. Закрывает дефекты аудита P1-2, P1-3, P1-4, P2-2, P2-3, P2-5, P2-6.
+# Версия читается из пакета (tgbot/__init__.py), поэтому она не расходится с кодом.
+# Закрывает дефекты аудита P1-2, P1-3, P1-4, P2-1, P2-2, P2-3, P2-5, P2-6.
 set -Eeuo pipefail
 
-VERSION="2.6.0"
+VERSION="unknown"
 
 BASE="${BASE:-/root/tgbot}"
 VENV="${VENV:-/opt/tgbot}"
@@ -19,6 +20,14 @@ UPGRADE_KEEP="${UPGRADE_KEEP:-5}"
 STAMP="$(date +%Y%m%d_%H%M%S)"
 BACKUP_DIR="$BACKUP_ROOT/upgrade_${STAMP}"
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# P2-1: единственный источник версии — пакет.
+if [[ -f "$SRC_DIR/tgbot/__init__.py" ]]; then
+  PKG_VERSION="$(sed -n 's/^__version__[[:space:]]*=[[:space:]]*"\([^"]*\)".*$/\1/p' "$SRC_DIR/tgbot/__init__.py" | head -n 1)"
+  if [[ -n "$PKG_VERSION" ]]; then
+    VERSION="$PKG_VERSION"
+  fi
+fi
 LOG_FILE="/dev/null"
 
 SKIP_TESTS="${SKIP_TESTS:-0}"
